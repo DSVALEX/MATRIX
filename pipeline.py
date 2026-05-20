@@ -1213,7 +1213,7 @@ def _ensure_numeric(df, input_path):
     if df['TOTAL_PRICE'].isna().any():
         df['TOTAL_PRICE'] = (df['RATE_BASE'].fillna(0) + df['RATE_EXTRA'].fillna(0)
                              + df['FUEL'].fillna(0) + df['MAUT'].fillna(0)
-                             + df['Linehaul UPSDE']
+                             + df['Linehaul UPSDE'])
     return df
 
 
