@@ -105,6 +105,48 @@ def file_bytes(p):
     return Path(p).read_bytes()
 
 
+DEFAULT_EXCEPTIONS = pd.DataFrame([
+    {'Enabled': True, 'Carrier': 'UPDE', 'Country (blank=all)': '',
+     'Size limit (m)': 1.5,  'Surcharge €/parcel': 6.0},
+    {'Enabled': True, 'Carrier': 'DPD',  'Country (blank=all)': '',
+     'Size limit (m)': 1.75, 'Surcharge €/parcel': 6.0},
+])
+
+
+def exception_rules_from_editor(edited_df):
+    """Convert the data-editor rows into pipeline exception-rule dicts.
+    Constraint column (USER_DEF_TYPE_4) and flag (AWKWARD='y') are fixed to the
+    CargoWrite schema; size limit, surcharge and scope are the editable knobs."""
+    rules = []
+    for _, row in edited_df.iterrows():
+        if not bool(row.get('Enabled', False)):
+            continue
+        carrier = str(row.get('Carrier', '') or '').strip()
+        country = str(row.get('Country (blank=all)', '') or '').strip().upper()
+        try:
+            limit = float(row.get('Size limit (m)'))
+        except (TypeError, ValueError):
+            continue
+        try:
+            sur = float(row.get('Surcharge €/parcel') or 0)
+        except (TypeError, ValueError):
+            sur = 0.0
+        rules.append({
+            'enabled':        True,
+            'label':          f'Oversize {carrier or "ALL"}',
+            'carriers':       [carrier] if carrier and carrier != '(all)' else [],
+            'countries':      [c.strip() for c in country.split(',') if c.strip()],
+            'constraint_col': 'USER_DEF_TYPE_4 (max 1,5m)',
+            'normal_value':   limit,
+            'bucket_value':   None,
+            'flag_col':       'AWKWARD',
+            'flag_value':     'y',
+            'surcharge':      sur,
+            'surcharge_mode': 'per_parcel',
+        })
+    return rules
+
+
 def make_zip(results):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -252,6 +294,35 @@ if selected:
                                                                  value=ov['postcode_prefix_range'][1], key=f'p1_{country}')
             st.session_state.country_overrides[country] = ov
 
+# ── Exceptions & buckets (add-on) ─────────────────────────────────────────────
+with st.expander("📐 Exceptions & buckets — oversize / surcharges per carrier",
+                 expanded=False):
+    st.caption(
+        "CargoWrite matches each order top-down and takes the first row that "
+        "fits. A size limit means a row only matches parcels at/under that size; "
+        "anything bigger must fall through to a **bucket** row that drops the "
+        "limit, flags it (AWKWARD), and adds a surcharge. Buckets are added to "
+        "every output and shown in amber. Leave the table empty for no buckets."
+    )
+    if 'exceptions_df' not in st.session_state:
+        st.session_state.exceptions_df = DEFAULT_EXCEPTIONS.copy()
+    edited = st.data_editor(
+        st.session_state.exceptions_df,
+        num_rows="dynamic", use_container_width=True, hide_index=True,
+        column_config={
+            'Enabled': st.column_config.CheckboxColumn(width="small"),
+            'Carrier': st.column_config.SelectboxColumn(
+                options=['(all)'] + list(pl.CARRIER_DEFAULTS), width="small"),
+            'Country (blank=all)': st.column_config.TextColumn(
+                help="ISO2 code(s), comma-separated. Blank = all countries.", width="small"),
+            'Size limit (m)': st.column_config.NumberColumn(
+                format="%.2f", help="Stamped on the normal (cheap) rows."),
+            'Surcharge €/parcel': st.column_config.NumberColumn(format="%.2f"),
+        },
+        key='exceptions_editor',
+    )
+    st.session_state.exceptions_df = edited
+
 st.divider()
 
 # ── Run ────────────────────────────────────────────────────────────────────────
@@ -262,6 +333,7 @@ if run_btn and uploaded and selected:
     st.session_state.results = {}
     input_path = st.session_state['input_path']
     errors = {}
+    rules = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
     progress = st.progress(0, text="Starting…")
 
     for idx, country in enumerate(selected):
@@ -276,7 +348,8 @@ if run_btn and uploaded and selected:
                 cd = carrier_defaults(fuel_vals, maut['DHL-ROS'], maut['DPD'])
                 vl = variables_layout(fuel_vals, maut['DHL-ROS'], maut['DPD'])
                 with tempfile.TemporaryDirectory() as tmp:
-                    result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl)
+                    result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
+                                                          exceptions=rules)
                     result = persist(result)
             else:
                 cd = carrier_defaults(fuel_vals, maut_dhl, maut_dpd)
@@ -284,7 +357,7 @@ if run_btn and uploaded and selected:
                 with tempfile.TemporaryDirectory() as tmp:
                     result = pl.run_pipeline(input_path, country, output_dir=tmp,
                                              country_cfg=cfg, carrier_defaults=cd,
-                                             variables_layout=vl)
+                                             variables_layout=vl, exceptions=rules)
                     result = persist(result)
 
             st.session_state.results[country] = result

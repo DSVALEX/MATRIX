@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import openpyxl
 from openpyxl import Workbook
+from openpyxl.styles import PatternFill
 
 log = logging.getLogger(__name__)
 
@@ -1095,14 +1096,18 @@ def write_matrix_excel(df, output_path, country_cfg,
     for ci, col in enumerate(COLUMN_ORDER, 1):
         ws.cell(1, ci, col)
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
+    bucket_fill = PatternFill('solid', fgColor='FFF2CC')   # soft amber = catch-all bucket
     for ri, row_dict in enumerate(df_sorted.to_dict('records'), start=2):
         formulas = _build_formulas_for_row(row_dict, ri, carrier_defaults)
+        is_bucket = bool(row_dict.get('_is_bucket'))
         for ci, col in enumerate(COLUMN_ORDER, 1):
             if col in formulas:
-                ws.cell(ri, ci, formulas[col])
+                cell = ws.cell(ri, ci, formulas[col])
             else:
                 val = row_dict.get(col)
-                ws.cell(ri, ci, None if pd.isna(val) else val)
+                cell = ws.cell(ri, ci, None if pd.isna(val) else val)
+            if is_bucket:
+                cell.fill = bucket_fill
     vs = wb.create_sheet('Variables')
     for ri, (name, val) in enumerate(vl, 1):
         vs.cell(ri, 1, name)
@@ -1231,11 +1236,132 @@ def optimize_globally(input_path, output_path):
 
 
 # ==============================================================================
+# 9b. EXCEPTIONS / BUCKETS  (add-on)
+# ==============================================================================
+#
+# CargoWrite matches an order by scanning the matrix top-to-bottom (cheapest
+# first) and taking the first row whose constraints all fit. A constraint such
+# as USER_DEF_TYPE_4 (a max dimension) means "this row only matches parcels at
+# or under this size". Orders that exceed it must still match *something*, so
+# every constrained row needs a cheaper-to-build "bucket" twin lower down that
+# drops the limit, flags the row for oversight, and adds a surcharge.
+#
+# An exception rule is a plain dict (general — not size-specific):
+#   {
+#     'enabled':        True,
+#     'label':          'Oversize (max 1.5m)',
+#     'carriers':       ['UPDE'],      # scope; [] = all carriers
+#     'countries':      [],            # scope; [] = all countries
+#     'constraint_col': 'USER_DEF_TYPE_4 (max 1,5m)',
+#     'normal_value':   1.5,           # stamped on the cheap base rows
+#     'bucket_value':   None,          # value on the bucket twin (None = catch-all)
+#     'flag_col':       'AWKWARD',     # column flagged on the bucket twin
+#     'flag_value':     'y',
+#     'surcharge':      6.0,           # euros
+#     'surcharge_mode': 'per_parcel',  # 'per_parcel' (× MAX_PARCEL) or 'flat'
+#   }
+#
+# FUTURE BUCKET IDEAS (designed for, not yet implemented):
+#   • parcel-count overflow  — a row with MAX_PARCEL blank to catch >max parcels
+#   • weight overflow        — a row with MAX_WEIGHT blank for over-grid weights
+#   • postcode catch-all     — a blank-POSTCODE row when zone rows miss a prefix
+#   apply_exceptions already leaves room for these: add a rule whose
+#   constraint_col is MAX_PARCEL / MAX_WEIGHT / POSTCODE and bucket_value=None.
+
+
+def _recompute_total(df):
+    df['TOTAL_PRICE'] = (
+        df['RATE_BASE'].fillna(0) + df['RATE_EXTRA'].fillna(0)
+        + df['FUEL'].fillna(0) + df['MAUT'].fillna(0)
+        + df['Linehaul UPSDE'].fillna(0)
+    ).round(4)
+    return df
+
+
+def apply_exceptions(df, rules):
+    """Stamp normal limits on in-scope base rows and append bucket twins.
+
+    Returns a new DataFrame with an extra boolean column '_is_bucket'
+    (write_matrix_excel uses it to colour the bucket rows). The base matrix is
+    expected to already carry numeric FUEL / MAUT / Linehaul columns.
+    """
+    if not rules:
+        return df
+
+    df = df.copy().reset_index(drop=True)
+    if '_is_bucket' not in df.columns:
+        df['_is_bucket'] = False
+
+    new_buckets = []
+    for rule in rules:
+        if not rule.get('enabled', True):
+            continue
+        ccol = rule['constraint_col']
+        if ccol not in df.columns:
+            log.warning("exception rule skipped — column '%s' not in matrix", ccol)
+            continue
+
+        scope = (~df['_is_bucket'])
+        if rule.get('carriers'):
+            scope &= df['CARRIER_ID'].isin(rule['carriers'])
+        if rule.get('countries'):
+            scope &= df['COUNTRYISO2'].isin(rule['countries'])
+        if not scope.any():
+            continue
+
+        # 1) stamp the normal limit onto the cheap base rows
+        df.loc[scope, ccol] = rule['normal_value']
+
+        # 2) build the bucket twins (limit removed, flagged, surcharged)
+        twins = df[scope].copy()
+        twins[ccol] = rule.get('bucket_value', None)
+        if rule.get('flag_col'):
+            twins[rule['flag_col']] = rule.get('flag_value', 'y')
+        sur = float(rule.get('surcharge', 0) or 0)
+        if rule.get('surcharge_mode', 'per_parcel') == 'per_parcel':
+            twins['RATE_EXTRA'] = twins['RATE_EXTRA'].fillna(0) + sur * twins['MAX_PARCEL']
+        else:
+            twins['RATE_EXTRA'] = twins['RATE_EXTRA'].fillna(0) + sur
+        twins['_is_bucket'] = True
+        new_buckets.append(twins)
+
+    if new_buckets:
+        df = pd.concat([df] + new_buckets, ignore_index=True)
+        df = _recompute_total(df)
+    return df
+
+
+def optimize_globally_df(df):
+    """Cross-carrier dominance on a DataFrame; returns the kept rows.
+    Same logic as optimize_globally but stays in pandas (no Excel round-trip),
+    so the exception/bucket step can run on the result before writing."""
+    df = df.reset_index(drop=True)
+    if df.empty:
+        return df
+    df_s = df.sort_values('TOTAL_PRICE', kind='stable').reset_index()
+    df_s = df_s.rename(columns={'index': '_orig'})
+    w  = df_s['MAX_WEIGHT'].values.astype(float)
+    p  = df_s['MAX_PARCEL'].values.astype(float)
+    e  = df_s['EACH_WEIGHT'].values.astype(float)
+    pc = df_s['POSTCODE'].values.astype(float)
+    pc_nan = np.isnan(pc)
+    orig = df_s['_orig'].values
+    dominated = set()
+    for i in range(1, len(df_s)):
+        pc_compat = pc_nan[:i] if pc_nan[i] else (pc_nan[:i] | (pc[:i] == pc[i]))
+        if (pc_compat & (w[:i] >= w[i]) & (p[:i] >= p[i]) & (e[:i] >= e[i])).any():
+            dominated.add(int(orig[i]))
+    keep = [i for i in range(len(df)) if i not in dominated]
+    return df.iloc[keep].reset_index(drop=True)
+
+
+# ==============================================================================
 # 10. ORCHESTRATOR
 # ==============================================================================
 
 def run_pipeline(input_path, country, output_dir='.',
-                 country_cfg=None, carrier_defaults=None, variables_layout=None):
+                 country_cfg=None, carrier_defaults=None, variables_layout=None,
+                 exceptions=None):
     """
     Full pipeline for one country.
 
@@ -1262,13 +1388,20 @@ def run_pipeline(input_path, country, output_dir='.',
 
     log.info('=== Pipeline for %s ===', country)
     parsed = parse_rate_cards(input_path)
-    return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl)
+    return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl, exceptions)
 
 
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
-                             carrier_defaults=None, variables_layout=None):
+                             carrier_defaults=None, variables_layout=None,
+                             exceptions=None):
     """Build/optimize/write from an already-parsed rate dict.
-    Used by the master-file path so the (expensive) parse happens only once."""
+    Used by the master-file path so the (expensive) parse happens only once.
+
+    If `exceptions` (a list of rule dicts) is given, each output also gets the
+    stamped limits + catch-all bucket rows (coloured), and the minimal stage
+    runs fully in pandas so buckets are added to the *surviving* rows only —
+    keeping the list as short as possible.
+    """
     cd = carrier_defaults or CARRIER_DEFAULTS
     vl = variables_layout or VARIABLES_LAYOUT
     country = country.upper()
@@ -1280,25 +1413,35 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
                          f"for carriers {cfg['carriers']}.")
 
     df = compute_numeric_totals(df, cd)
-
     out = Path(output_dir)
     ext_path = out / f'{country}_Matrix_extended.xlsx'
-    write_matrix_excel(df, ext_path, cfg, cd, vl)
+    opt_path = out / f'{country}_Matrix_optimized.xlsx'
+    min_path = out / f'{country}_Matrix_minimal.xlsx'
 
     df_opt = optimize_matrix(df)
-    opt_path = out / f'{country}_Matrix_optimized.xlsx'
-    write_matrix_excel(df_opt, opt_path, cfg, cd, vl)
 
-    min_path = out / f'{country}_Matrix_minimal.xlsx'
-    stats    = optimize_globally(opt_path, min_path)
+    if exceptions:
+        # buckets added to surviving rows of each stage, written fresh (pandas flow)
+        df_min  = optimize_globally_df(df_opt)
+        ext_b   = apply_exceptions(df, exceptions)
+        opt_b   = apply_exceptions(df_opt, exceptions)
+        min_b   = apply_exceptions(df_min, exceptions)
+        write_matrix_excel(ext_b, ext_path, cfg, cd, vl)
+        write_matrix_excel(opt_b, opt_path, cfg, cd, vl)
+        write_matrix_excel(min_b, min_path, cfg, cd, vl)
+        rows_ext, rows_opt, rows_min = len(ext_b), len(opt_b), len(min_b)
+    else:
+        write_matrix_excel(df, ext_path, cfg, cd, vl)
+        write_matrix_excel(df_opt, opt_path, cfg, cd, vl)
+        stats = optimize_globally(opt_path, min_path)
+        rows_ext, rows_opt, rows_min = len(df), len(df_opt), stats['output_rows']
 
-    log.info('=== Done: %d ext / %d opt / %d min ===',
-             len(df), len(df_opt), stats['output_rows'])
+    log.info('=== Done: %d ext / %d opt / %d min ===', rows_ext, rows_opt, rows_min)
     return {
         'extended':      str(ext_path),
         'optimized':     str(opt_path),
         'minimal':       str(min_path),
-        'rows_extended': len(df),
-        'rows_optimized': len(df_opt),
-        'rows_minimal':  stats['output_rows'],
+        'rows_extended': rows_ext,
+        'rows_optimized': rows_opt,
+        'rows_minimal':  rows_min,
     }

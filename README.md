@@ -63,3 +63,29 @@ the one to use).
 Carrier defaults and country configs live in `pipeline.py`
 (`CARRIER_DEFAULTS`, `COUNTRY_CONFIG`). The master-file sheet names and parsing
 logic live in `master_parser.py`. Edit and redeploy.
+
+
+## Exceptions & buckets (add-on)
+
+CargoWrite picks the first matrix row (cheapest-first) whose constraints all
+fit an order. A constraint like a **size limit** means a row only matches
+parcels at/under that size — so oversized orders need a **bucket** row lower
+down that drops the limit, flags it, and adds a surcharge. Without buckets,
+some orders match nothing.
+
+In the app, open **📐 Exceptions & buckets** and edit the table — one line per
+carrier (or country). Each line says: *for this carrier, the normal size limit
+is X metres; anything bigger gets a €Y-per-parcel surcharge.* On Generate, every
+output gets:
+- the **normal limit** stamped on the cheap base rows
+- a **catch-all bucket twin** (limit blank, `AWKWARD=y`, surcharge added),
+  shown in **amber** for oversight
+
+The mechanism is general: in `pipeline.py`, `apply_exceptions()` takes a list of
+rule dicts (constraint column, normal value, surcharge, scope). Today the UI
+exposes the size case; the same function already supports flat surcharges and
+other constraint columns. Documented future buckets (parcel-count overflow,
+weight overflow, postcode catch-all) are noted in the code and need only a new
+rule, not new logic.
+
+Leave the table empty for a plain matrix with no buckets.
