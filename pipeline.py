@@ -1044,7 +1044,7 @@ def compute_numeric_totals(df, carrier_defaults=None):
 
     df['TOTAL_PRICE'] = (
         df['RATE_BASE'] + df['RATE_EXTRA'].fillna(0) + df['FUEL'] + df['MAUT']
-        + df['Linehaul UPSDE']
+        + df['Linehaul UPSDE'].fillna(0)
     ).round(4)
     return df
 
@@ -1213,7 +1213,7 @@ def _ensure_numeric(df, input_path):
     if df['TOTAL_PRICE'].isna().any():
         df['TOTAL_PRICE'] = (df['RATE_BASE'].fillna(0) + df['RATE_EXTRA'].fillna(0)
                              + df['FUEL'].fillna(0) + df['MAUT'].fillna(0)
-                             + df['Linehaul UPSDE'])
+                             + df['Linehaul UPSDE'].fillna(0))
     return df
 
 
@@ -1278,7 +1278,7 @@ def _recompute_total(df):
     df['TOTAL_PRICE'] = (
         df['RATE_BASE'].fillna(0) + df['RATE_EXTRA'].fillna(0)
         + df['FUEL'].fillna(0) + df['MAUT'].fillna(0)
-        + df['Linehaul UPSDE']
+        + df['Linehaul UPSDE'].fillna(0)
     ).round(4)
     return df
 
