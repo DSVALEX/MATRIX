@@ -147,6 +147,58 @@ def exception_rules_from_editor(edited_df):
     return rules
 
 
+DEFAULT_OVERFLOW = pd.DataFrame([
+    {'Enabled': False, 'Carrier': 'UPDE', 'Country (blank=all)': '',
+     'Overflow rate €/parcel': 0.0, 'Surcharge €/parcel': 6.0},
+])
+
+DEFAULT_POSTCODE = pd.DataFrame([
+    {'Enabled': False, 'Carrier': 'UPDE', 'Country (blank=all)': '',
+     'Surcharge €': 0.0},
+])
+
+
+def overflow_rules_from_editor(edited_df):
+    rules = []
+    for _, row in edited_df.iterrows():
+        if not bool(row.get('Enabled', False)):
+            continue
+        try:
+            rate = float(row.get('Overflow rate €/parcel'))
+        except (TypeError, ValueError):
+            continue
+        if rate <= 0:          # overflow rate must be supplied (no guessing)
+            continue
+        carrier = str(row.get('Carrier','') or '').strip()
+        country = str(row.get('Country (blank=all)','') or '').strip().upper()
+        rules.append({
+            'enabled': True,
+            'carriers': [carrier] if carrier and carrier != '(all)' else [],
+            'countries': [c.strip() for c in country.split(',') if c.strip()],
+            'overflow_rate': rate,
+            'surcharge': float(row.get('Surcharge €/parcel') or 0),
+            'flag_col': 'AWKWARD', 'flag_value': 'Y',
+        })
+    return rules
+
+
+def postcode_rules_from_editor(edited_df):
+    rules = []
+    for _, row in edited_df.iterrows():
+        if not bool(row.get('Enabled', False)):
+            continue
+        carrier = str(row.get('Carrier','') or '').strip()
+        country = str(row.get('Country (blank=all)','') or '').strip().upper()
+        rules.append({
+            'enabled': True,
+            'carriers': [carrier] if carrier and carrier != '(all)' else [],
+            'countries': [c.strip() for c in country.split(',') if c.strip()],
+            'surcharge': float(row.get('Surcharge €') or 0),
+            'flag_col': 'AWKWARD', 'flag_value': 'Y',
+        })
+    return rules
+
+
 def make_zip(results):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -323,6 +375,42 @@ with st.expander("📐 Exceptions & buckets — oversize / surcharges per carrie
     )
     st.session_state.exceptions_df = edited
 
+    st.markdown('---')
+    st.markdown("**Overflow buckets** — catch orders heavier or with more "
+                "parcels than the grid. Off by default. The overflow rate (€ per "
+                "parcel) is your contract heavy/per-kg rate — it is **not** guessed.")
+    if 'overflow_df' not in st.session_state:
+        st.session_state.overflow_df = DEFAULT_OVERFLOW.copy()
+    ov_edit = st.data_editor(
+        st.session_state.overflow_df, num_rows="dynamic",
+        use_container_width=True, hide_index=True,
+        column_config={
+            'Enabled': st.column_config.CheckboxColumn(width="small"),
+            'Carrier': st.column_config.SelectboxColumn(
+                options=['(all)'] + list(pl.CARRIER_DEFAULTS), width="small"),
+            'Country (blank=all)': st.column_config.TextColumn(width="small"),
+            'Overflow rate €/parcel': st.column_config.NumberColumn(format="%.2f"),
+            'Surcharge €/parcel': st.column_config.NumberColumn(format="%.2f"),
+        }, key='overflow_editor')
+    st.session_state.overflow_df = ov_edit
+
+    st.markdown("**Postcode catch-all** — for zoned carriers, add a blank-postcode "
+                "fallback at the worst zone's rate so an unlisted prefix still matches. "
+                "Off by default.")
+    if 'postcode_df' not in st.session_state:
+        st.session_state.postcode_df = DEFAULT_POSTCODE.copy()
+    pc_edit = st.data_editor(
+        st.session_state.postcode_df, num_rows="dynamic",
+        use_container_width=True, hide_index=True,
+        column_config={
+            'Enabled': st.column_config.CheckboxColumn(width="small"),
+            'Carrier': st.column_config.SelectboxColumn(
+                options=['(all)'] + list(pl.CARRIER_DEFAULTS), width="small"),
+            'Country (blank=all)': st.column_config.TextColumn(width="small"),
+            'Surcharge €': st.column_config.NumberColumn(format="%.2f"),
+        }, key='postcode_editor')
+    st.session_state.postcode_df = pc_edit
+
 st.divider()
 
 # ── Run ────────────────────────────────────────────────────────────────────────
@@ -334,6 +422,8 @@ if run_btn and uploaded and selected:
     input_path = st.session_state['input_path']
     errors = {}
     rules = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
+    ov_rules = overflow_rules_from_editor(st.session_state.get('overflow_df', DEFAULT_OVERFLOW))
+    pc_rules = postcode_rules_from_editor(st.session_state.get('postcode_df', DEFAULT_POSTCODE))
     progress = st.progress(0, text="Starting…")
 
     for idx, country in enumerate(selected):
@@ -349,7 +439,9 @@ if run_btn and uploaded and selected:
                 vl = variables_layout(fuel_vals, maut['DHL-ROS'], maut['DPD'])
                 with tempfile.TemporaryDirectory() as tmp:
                     result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
-                                                          exceptions=rules)
+                                                          exceptions=rules,
+                                                          overflow_rules=ov_rules,
+                                                          postcode_rules=pc_rules)
                     result = persist(result)
             else:
                 cd = carrier_defaults(fuel_vals, maut_dhl, maut_dpd)
@@ -357,7 +449,8 @@ if run_btn and uploaded and selected:
                 with tempfile.TemporaryDirectory() as tmp:
                     result = pl.run_pipeline(input_path, country, output_dir=tmp,
                                              country_cfg=cfg, carrier_defaults=cd,
-                                             variables_layout=vl, exceptions=rules)
+                                             variables_layout=vl, exceptions=rules,
+                                             overflow_rules=ov_rules, postcode_rules=pc_rules)
                     result = persist(result)
 
             st.session_state.results[country] = result

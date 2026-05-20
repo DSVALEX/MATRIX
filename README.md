@@ -89,3 +89,24 @@ weight overflow, postcode catch-all) are noted in the code and need only a new
 rule, not new logic.
 
 Leave the table empty for a plain matrix with no buckets.
+
+
+### Future buckets (now implemented, off by default)
+
+Two more bucket types live under the same expander, both **off by default**:
+
+**Overflow buckets** — catch orders heavier or with more parcels than the grid.
+For each parcel count *n* the matrix gets a row with `MIN_PARCEL=n`,
+`MIN_WEIGHT=n×max-each-weight` and **no upper caps**, priced
+`overflow rate × n + surcharge × n` and flagged. The overflow rate is the
+contract heavy/per-kg rate **you enter** — it is never guessed from the grid.
+
+**Postcode catch-all** — for zoned carriers (e.g. UPS DE), adds a blank-postcode
+fallback at the worst zone's rate so a prefix not present in any zone still
+matches something, flagged for review.
+
+All three bucket types stack and are added to the *surviving* rows after
+optimization, keeping the final list as short as possible. The engine functions
+are `apply_exceptions`, `add_overflow_buckets`, and `add_postcode_catchall` in
+`pipeline.py` — each takes generic rule dicts, so new constraint columns or
+scopes need a new rule, not new logic.

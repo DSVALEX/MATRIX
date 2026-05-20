@@ -1069,9 +1069,14 @@ def _build_formulas_for_row(row_dict, excel_row, carrier_defaults=None):
     L   = COL_LETTER
     cfg = cd[row_dict['CARRIER_ID']]
     f   = {}
-    f['MAX_WEIGHT']  = f"={L['MAX_PARCEL']}{excel_row}*{L['EACH_WEIGHT']}{excel_row}"
-    f['MAX_VOLUME']  = f"={L['MAX_WEIGHT']}{excel_row}/{cfg['volume_divisor']}"
-    f['EACH_VOLUME'] = f"={L['EACH_WEIGHT']}{excel_row}/{cfg['volume_divisor']}"
+    # Overflow buckets leave MAX_PARCEL / EACH_WEIGHT blank — skip the grid
+    # formulas for them so we don't emit "=*" ; their values stay literal (None).
+    has_grid = (row_dict.get('MAX_PARCEL') is not None
+                and row_dict.get('EACH_WEIGHT') is not None)
+    if has_grid:
+        f['MAX_WEIGHT']  = f"={L['MAX_PARCEL']}{excel_row}*{L['EACH_WEIGHT']}{excel_row}"
+        f['MAX_VOLUME']  = f"={L['MAX_WEIGHT']}{excel_row}/{cfg['volume_divisor']}"
+        f['EACH_VOLUME'] = f"={L['EACH_WEIGHT']}{excel_row}/{cfg['volume_divisor']}"
     if cfg.get('fuel_variables_ref'):
         ref = cfg['fuel_variables_ref']
         f['FUEL'] = f"=Variables!${ref[0]}${ref[1:]}*{L['RATE_BASE']}{excel_row}"
@@ -1331,6 +1336,125 @@ def apply_exceptions(df, rules):
     return df
 
 
+def add_overflow_buckets(df, rules, carrier_defaults=None, country_cfg=None):
+    """Append combined parcel+weight overflow buckets (matches the corrected
+    example's structure). For each in-scope (carrier, service, country) and each
+    parcel count n in 1..grid_max_parcels, add a catch-all row:
+
+        MIN_PARCEL = n,            MAX_PARCEL = blank   (catches >= n parcels)
+        MIN_WEIGHT = n*grid_max,   MAX_WEIGHT = blank   (catches over-grid weight)
+        EACH_WEIGHT = blank
+        RATE_BASE  = overflow_rate * n       (overflow_rate is manager-supplied)
+        RATE_EXTRA = surcharge * n
+        flag       = AWKWARD = 'Y'
+
+    The overflow_rate is NOT inferred from the grid (the example used a hand-set
+    heavy/per-kg rate); it must be provided in the rule. Rows are flagged so ops
+    can review every overflow shipment.
+    """
+    cd = carrier_defaults or CARRIER_DEFAULTS
+    if not rules:
+        return df
+    df = df.copy().reset_index(drop=True)
+    if '_is_bucket' not in df.columns:
+        df['_is_bucket'] = False
+
+    new = []
+    for rule in rules:
+        if not rule.get('enabled', True):
+            continue
+        try:
+            rate = float(rule['overflow_rate'])
+        except (TypeError, ValueError, KeyError):
+            log.warning('overflow rule skipped — no valid overflow_rate'); continue
+        sur      = float(rule.get('surcharge', 0) or 0)
+        flag_col = rule.get('flag_col', 'AWKWARD')
+        flag_val = rule.get('flag_value', 'Y')
+
+        base = df[~df['_is_bucket']]
+        if rule.get('carriers'):
+            base = base[base['CARRIER_ID'].isin(rule['carriers'])]
+        if rule.get('countries'):
+            base = base[base['COUNTRYISO2'].isin(rule['countries'])]
+        if base.empty:
+            continue
+
+        for (carrier, svc, country), grp in base.groupby(
+                ['CARRIER_ID', 'SERVICE_LEVEL', 'COUNTRYISO2']):
+            # Grid ceilings come from the country config (the TRUE limits), not
+            # the post-optimization frame where weight bands have collapsed.
+            if country_cfg:
+                max_p    = int(country_cfg['max_parcel_count'])
+                grid_max = float(country_cfg['max_each_weight_kg'])
+            else:
+                max_p    = int(grp['MAX_PARCEL'].max())
+                grid_max = float(grp['EACH_WEIGHT'].max())
+            site, client = grp.iloc[0]['SITE_ID'], grp.iloc[0]['CLIENT_ID']
+            for n in range(1, max_p + 1):
+                row = _common(site, client, carrier, country)
+                rb  = round(rate * n, 4)
+                fuel = round(cd[carrier]['fuel_pct'] * rb, 4)
+                maut = round(cd[carrier]['maut_pct'] * rb, 4)
+                lh_pp = cd[carrier]['linehaul_per_parcel']
+                lh   = round(lh_pp * n, 4) if lh_pp > 0 else None
+                row.update({
+                    'SERVICE_LEVEL': svc,
+                    'MIN_PARCEL': n,       'MAX_PARCEL': None,
+                    'MIN_WEIGHT': round(n * grid_max, 4), 'MAX_WEIGHT': None,
+                    'EACH_WEIGHT': None,   'MAX_VOLUME': None, 'EACH_VOLUME': None,
+                    'RATE_BASE': rb,       'RATE_EXTRA': round(sur * n, 4),
+                    'FUEL': fuel,          'MAUT': maut, 'Linehaul UPSDE': lh,
+                    flag_col: flag_val,    '_is_bucket': True,
+                })
+                row['TOTAL_PRICE'] = round(rb + sur * n + fuel + maut + (lh or 0), 4)
+                new.append(row)
+
+    if new:
+        df = pd.concat([df, pd.DataFrame(new)], ignore_index=True)
+    return df
+
+
+def add_postcode_catchall(df, rules, carrier_defaults=None):
+    """For zoned carriers (rows carrying a specific POSTCODE prefix), append a
+    POSTCODE=blank fallback at the worst (most expensive) zone's rate, flagged,
+    so a prefix not present in any zone still matches something."""
+    if not rules:
+        return df
+    df = df.copy().reset_index(drop=True)
+    if '_is_bucket' not in df.columns:
+        df['_is_bucket'] = False
+
+    new = []
+    for rule in rules:
+        if not rule.get('enabled', True):
+            continue
+        sur      = float(rule.get('surcharge', 0) or 0)
+        flag_col = rule.get('flag_col', 'AWKWARD')
+        flag_val = rule.get('flag_value', 'Y')
+
+        base = df[(~df['_is_bucket']) & (df['POSTCODE'].notna())]
+        if rule.get('carriers'):
+            base = base[base['CARRIER_ID'].isin(rule['carriers'])]
+        if rule.get('countries'):
+            base = base[base['COUNTRYISO2'].isin(rule['countries'])]
+        if base.empty:
+            continue
+
+        # worst-case row per (carrier, service, country, parcels, each-weight)
+        keys = ['CARRIER_ID', 'SERVICE_LEVEL', 'COUNTRYISO2', 'MAX_PARCEL', 'EACH_WEIGHT']
+        worst = base.loc[base.groupby(keys)['TOTAL_PRICE'].idxmax()].copy()
+        worst['POSTCODE']   = None
+        worst['RATE_EXTRA'] = worst['RATE_EXTRA'].fillna(0) + sur
+        worst[flag_col]     = flag_val
+        worst['_is_bucket'] = True
+        new.append(worst)
+
+    if new:
+        df = pd.concat([df] + new, ignore_index=True)
+        df = _recompute_total(df)
+    return df
+
+
 def optimize_globally_df(df):
     """Cross-carrier dominance on a DataFrame; returns the kept rows.
     Same logic as optimize_globally but stays in pandas (no Excel round-trip),
@@ -1361,7 +1485,7 @@ def optimize_globally_df(df):
 
 def run_pipeline(input_path, country, output_dir='.',
                  country_cfg=None, carrier_defaults=None, variables_layout=None,
-                 exceptions=None):
+                 exceptions=None, overflow_rules=None, postcode_rules=None):
     """
     Full pipeline for one country.
 
@@ -1388,12 +1512,14 @@ def run_pipeline(input_path, country, output_dir='.',
 
     log.info('=== Pipeline for %s ===', country)
     parsed = parse_rate_cards(input_path)
-    return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl, exceptions)
+    return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl,
+                                    exceptions, overflow_rules, postcode_rules)
 
 
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
                              carrier_defaults=None, variables_layout=None,
-                             exceptions=None):
+                             exceptions=None, overflow_rules=None,
+                             postcode_rules=None):
     """Build/optimize/write from an already-parsed rate dict.
     Used by the master-file path so the (expensive) parse happens only once.
 
@@ -1420,12 +1546,20 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
 
     df_opt = optimize_matrix(df)
 
-    if exceptions:
-        # buckets added to surviving rows of each stage, written fresh (pandas flow)
-        df_min  = optimize_globally_df(df_opt)
-        ext_b   = apply_exceptions(df, exceptions)
-        opt_b   = apply_exceptions(df_opt, exceptions)
-        min_b   = apply_exceptions(df_min, exceptions)
+    any_buckets = bool(exceptions or overflow_rules or postcode_rules)
+    if any_buckets:
+        # buckets added to surviving rows of each stage, written fresh (pandas flow).
+        # Order: overflow + postcode catch-alls first, then size buckets last so the
+        # size rule (which skips existing buckets) only stamps the normal grid rows.
+        df_min = optimize_globally_df(df_opt)
+
+        def _decorate(d):
+            d = add_overflow_buckets(d, overflow_rules, cd, cfg)
+            d = add_postcode_catchall(d, postcode_rules, cd)
+            d = apply_exceptions(d, exceptions)
+            return d
+
+        ext_b, opt_b, min_b = _decorate(df), _decorate(df_opt), _decorate(df_min)
         write_matrix_excel(ext_b, ext_path, cfg, cd, vl)
         write_matrix_excel(opt_b, opt_path, cfg, cd, vl)
         write_matrix_excel(min_b, min_path, cfg, cd, vl)
