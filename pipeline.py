@@ -1087,7 +1087,7 @@ def _build_formulas_for_row(row_dict, excel_row, carrier_defaults=None):
     f['TOTAL_PRICE'] = (
         f"={L['RATE_BASE']}{excel_row}+{L['RATE_EXTRA']}{excel_row}"
         f"+{L['FUEL']}{excel_row}+{L['MAUT']}{excel_row}"
-        f'+{lh}{excel_row}'
+        f'+{lh}{excel_row}
     )
     return f
 
