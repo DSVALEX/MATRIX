@@ -313,8 +313,14 @@ def _parse_linehaul(ws):
 # ==============================================================================
 
 def parse_master_rate_card(path):
-    """Parse the entire master workbook once into a structured dict."""
+    """Parse the entire master workbook once into a structured dict.
+
+    Returns
+    -------
+    (dict, list)  — master data dict, list of human-readable warning strings.
+    """
     wb = openpyxl.load_workbook(path, data_only=True)
+    warnings = []
 
     def sheet(*hints):
         return pl._find_sheet(wb, *hints)
@@ -328,6 +334,12 @@ def parse_master_rate_card(path):
     ws = sheet('ZONES UPSDE')
     if ws:
         master['UPSDE']['zones_by_country'] = _parse_upsde_zones(ws)
+        if not master['UPSDE']['zones_by_country']:
+            warnings.append("UPS DE: zone sheet found but no country zones parsed")
+    else:
+        warnings.append("UPS DE: zone sheet (ZONES UPSDE) not found")
+
+    stds_found = stdm_found = exps_found = False
     for key, hint in [('STDS_by_zone', 'PARCEL - UPS - STDS'),
                       ('STDM_by_zone', 'PARCEL - UPS - STDM'),
                       ('EXPRESS_SAVER_by_zone', 'PARCEL - EXPRESS SAVER UPSDE')]:
@@ -336,20 +348,46 @@ def parse_master_rate_card(path):
             hrow, fc, tc = _scan_from_to(ws)
             if hrow:
                 master['UPSDE'][key] = _extract_zone_tiers(ws, hrow, fc, tc)
+                if not master['UPSDE'][key]:
+                    warnings.append(f"UPS DE: sheet '{hint}' found but no zone tiers extracted")
+            else:
+                warnings.append(f"UPS DE: sheet '{hint}' found but no From/To header located")
+        else:
+            warnings.append(f"UPS DE: rate sheet '{hint}' not found")
+
     ws = sheet('PARCEL - EXPSAVER UPSDE 7R9W62')
     if ws:
         master['UPSDE']['expsaver_7r9w62'] = _flat_country_rates(ws)
+        if not master['UPSDE']['expsaver_7r9w62']:
+            warnings.append("UPS DE: ExpSaver 7R9W62 sheet found but no country rates parsed")
+    else:
+        warnings.append("UPS DE: ExpSaver 7R9W62 sheet not found — CH/NO flat rates unavailable")
+
     ws = sheet('PARCEL - UPS - WEA')
     if ws:
         master['UPSDE']['wea'] = _flat_country_rates(ws)
+        if not master['UPSDE']['wea']:
+            warnings.append("UPS DE: WEA sheet found but no country rates parsed")
+    else:
+        warnings.append("UPS DE: WEA sheet not found — WorldEase rates unavailable")
+
     ws = sheet('PARCEL - UPS DE - LINEHAUL', 'PARCEL - UPS - LINEHAUL')
     if ws:
         master['UPSDE']['linehaul'] = _parse_linehaul(ws)
+        if master['UPSDE']['linehaul'] is None:
+            warnings.append("UPS DE: linehaul sheet found but rate value not located")
+    else:
+        warnings.append("UPS DE: linehaul sheet not found — linehaul will use config default")
 
     # ── UPSNL ────────────────────────────────────────────────────────────────
     ws = sheet('ZONES UPSNL EXPRESS', 'ZONES UPSNL')
     if ws:
         master['UPSNL']['zones_by_country'] = _parse_upsnl_zones(ws)
+        if not master['UPSNL']['zones_by_country']:
+            warnings.append("UPS NL: zone sheet found but no country zones parsed")
+    else:
+        warnings.append("UPS NL: zone sheet not found — carrier will be skipped")
+
     ws = sheet('PARCEL - EXPRESS SAVER UPSNL')
     if ws:
         hrow, fc, tc = _scan_from_to(ws)
@@ -357,44 +395,100 @@ def parse_master_rate_card(path):
             rbz = _extract_zone_tiers(ws, hrow, fc, tc)
             master['UPSNL']['rates_by_zone'] = {k: v for k, v in rbz.items()
                                                 if isinstance(k, int)}
+            if not master['UPSNL']['rates_by_zone']:
+                warnings.append("UPS NL: Express Saver sheet found but no zone rates extracted")
+        else:
+            warnings.append("UPS NL: Express Saver sheet found but no From/To header located")
+    else:
+        warnings.append("UPS NL: Express Saver rate sheet not found — carrier will produce no rows")
 
     # ── DHL ──────────────────────────────────────────────────────────────────
     ws = sheet('PARCEL - DHL - Other countries')
     if ws:
         master['DHL']['other'] = _parse_dhl_other(ws)
+        if not master['DHL']['other']:
+            warnings.append("DHL: 'Other countries' sheet found but no country rates parsed")
+    else:
+        warnings.append("DHL: 'Other countries' sheet not found")
+
     ws = sheet('PARCEL - DHL - BNL')
     if ws:
         master['DHL']['bnl'] = _parse_dhl_bnl(ws)
+        if not master['DHL']['bnl']:
+            warnings.append("DHL: BNL sheet found but no rates parsed (BE/LU/NL may be missing)")
+    else:
+        warnings.append("DHL: BNL sheet not found — BE/LU/NL will fall back to 'other' rates")
+
+    if not master['DHL'].get('other') and not master['DHL'].get('bnl'):
+        warnings.append("DHL: no rate data found at all — carrier will be skipped for all countries")
 
     # ── DPD ──────────────────────────────────────────────────────────────────
     ws = sheet('PARCEL - DPD')
     if ws:
         master['DPD'] = _parse_dpd(ws)
+        if not master['DPD']:
+            warnings.append("DPD: sheet found but no country rates parsed")
+    else:
+        warnings.append("DPD: sheet not found — carrier will be skipped for all countries")
 
     # ── PostNord ──────────────────────────────────────────────────────────────
     ws = sheet('PARCEL - POSTNORD - STD', 'PARCEL - POSTNORD')
     if ws:
         master['POSTNORD'] = _parse_postnord(ws)
+        if not master['POSTNORD']:
+            warnings.append("PostNord: sheet found but no country rates parsed")
+    else:
+        warnings.append("PostNord: sheet not found — carrier will be skipped for SE/DK/NO/FI")
 
     # ── MAUT ──────────────────────────────────────────────────────────────────
     ws = sheet('MAUT SURCHARGE', 'MAUT')
     if ws:
         master['MAUT'] = _parse_maut(ws)
+        if not master['MAUT']:
+            warnings.append("MAUT: sheet found but no surcharge data parsed — 0% will be used")
+    else:
+        warnings.append("MAUT: surcharge sheet not found — 0% MAUT will be used for all countries")
 
     # ── UPSGB ──────────────────────────────────────────────────────────────────
     gb = {}
     ws = sheet('PARCEL - UPSGB - STDS')
-    if ws: gb['STDS'] = _parse_gb_tiers(ws)
+    if ws:
+        gb['STDS'] = _parse_gb_tiers(ws)
+        if not gb['STDS']:
+            warnings.append("UPS GB: STDS sheet found but no tiers parsed")
+    else:
+        warnings.append("UPS GB: STDS sheet not found")
+
     ws = sheet('PARCEL - UPSGB - STDM')
-    if ws: gb['STDM'] = _parse_gb_tiers(ws)
+    if ws:
+        gb['STDM'] = _parse_gb_tiers(ws)
+        if not gb['STDM']:
+            warnings.append("UPS GB: STDM sheet found but no tiers parsed")
+    else:
+        warnings.append("UPS GB: STDM sheet not found")
+
     ws = sheet('PARCEL - UPSGB - EXPS')
-    if ws: gb['EXPS'] = _parse_gb_tiers(ws)
+    if ws:
+        gb['EXPS'] = _parse_gb_tiers(ws)
+        if not gb['EXPS']:
+            warnings.append("UPS GB: EXPS sheet found but no tiers parsed")
+    else:
+        warnings.append("UPS GB: EXPS sheet not found")
+
     ws = sheet('PARCEL - UPS GB - LINEHAUL', 'PARCEL - UPSGB - LINEHAUL')
-    if ws: gb['linehaul'] = _parse_linehaul(ws)
+    if ws:
+        gb['linehaul'] = _parse_linehaul(ws)
+        if gb['linehaul'] is None:
+            warnings.append("UPS GB: linehaul sheet found but rate value not located")
+    else:
+        warnings.append("UPS GB: linehaul sheet not found — GB linehaul will use config default")
+
     if gb:
         master['UPSGB'] = gb
+    else:
+        warnings.append("UPS GB: no sheets found at all — GB will be skipped")
 
-    return master
+    return master, warnings
 
 
 # ==============================================================================

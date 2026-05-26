@@ -491,14 +491,25 @@ def _parse_postnord_sheet(ws):
 
 
 def parse_rate_cards(excel_path):
-    """Parse all carrier rate tables from the uploaded Excel. Fuzzy sheet matching."""
-    wb  = openpyxl.load_workbook(excel_path, data_only=True)
-    out = {}
+    """Parse all carrier rate tables from the uploaded Excel. Fuzzy sheet matching.
+
+    Returns
+    -------
+    (dict, list)  — parsed rate data, list of human-readable warning strings.
+    Every missing sheet or failed parse appends a warning; callers should
+    surface these to the user rather than burying them in server logs.
+    """
+    wb       = openpyxl.load_workbook(excel_path, data_only=True)
+    out      = {}
+    warnings = []
 
     # ── UPSDE ────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'UPSDE', 'UPS DE', 'UPS-DE', 'UPDE')
     if ws:
         upde = {'zones': _parse_upsde_zones(ws)}
+        if not upde['zones']:
+            warnings.append("UPS DE: zone table not found in sheet — postcode routing will be skipped")
+
         for label, key in [('PARCEL - UPS - STDS', 'STDS'),
                             ('PARCEL - UPS - STDM', 'STDM')]:
             anchor = _scan_anchor(ws, label)
@@ -508,6 +519,10 @@ def parse_rate_cards(excel_path):
                 if hrow:
                     upde[f'{key}_by_zone'] = _extract_rates_by_zone(ws, hrow, fc, tc)
                     upde[key] = _extract_tiers(ws, hrow, fc, tc, tc + 1)
+                else:
+                    warnings.append(f"UPS DE: found anchor '{label}' but no From/To header nearby")
+            else:
+                warnings.append(f"UPS DE: rate table '{label}' not found")
 
         anchor = _scan_anchor(ws, 'EXPSAVER UPSDE 7R9W62', 'EXPSAVER 7R9W62')
         if anchor:
@@ -550,6 +565,8 @@ def parse_rate_cards(excel_path):
                 upde['EXPRESS_SAVER'] = _extract_tiers(ws, hrow, fc, tc, tc + 1)
 
         out['UPDE'] = upde
+    else:
+        warnings.append("UPS DE: sheet not found — carrier will be skipped for all countries")
 
     # ── UPSNL ────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'UPSNL', 'UPS NL', 'UPS-NL')
@@ -595,6 +612,12 @@ def parse_rate_cards(excel_path):
                             })
                         except (TypeError, ValueError):
                             continue
+                else:
+                    warnings.append("UPS NL: zone table found but Express Saver zone column not identified")
+            else:
+                warnings.append("UPS NL: zone anchor found but no From/To header nearby")
+        else:
+            warnings.append("UPS NL: zone table not found — postcode routing will be skipped")
 
         anchor = _scan_anchor(ws, 'PARCEL - EXPRESS SAVER UPSNL', 'EXPRESS SAVER UPSNL',
                               'Rates UPSNL express saver', 'Rates UPSNL')
@@ -605,7 +628,16 @@ def parse_rate_cards(excel_path):
                 rbz = _extract_rates_by_zone(ws, hrow, fc, tc)
                 upsnl['rates_by_zone'] = {k: v for k, v in rbz.items()
                                           if isinstance(k, int)}
+                if not upsnl['rates_by_zone']:
+                    warnings.append("UPS NL: Express Saver rate table found but no zone rates parsed")
+            else:
+                warnings.append("UPS NL: Express Saver anchor found but no From/To header nearby")
+        else:
+            warnings.append("UPS NL: Express Saver rate table not found — carrier will produce no rows")
+
         out['UPSNL'] = upsnl
+    else:
+        warnings.append("UPS NL: sheet not found — carrier will be skipped for all countries")
 
     # ── DHL ──────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'DHL', 'DHL-ROS', 'DHL ROS')
@@ -618,6 +650,14 @@ def parse_rate_cards(excel_path):
                 tiers = _extract_tiers(ws, hrow, fc, tc, tc + 1)
                 if tiers:
                     out['DHL-ROS'] = {'STANDARD': tiers}
+                else:
+                    warnings.append("DHL: rate anchor and From/To found but no weight tiers extracted")
+            else:
+                warnings.append("DHL: rate anchor found but no From/To header nearby")
+        else:
+            warnings.append("DHL: rate table anchor not found in sheet — carrier will be skipped")
+    else:
+        warnings.append("DHL: sheet not found — carrier will be skipped for all countries")
 
     # ── DPD ──────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'DPD')
@@ -645,6 +685,12 @@ def parse_rate_cards(excel_path):
                     break
             if rates:
                 out['DPD'] = rates
+            else:
+                warnings.append("DPD: rate anchor found but no groot/klein rates extracted")
+        else:
+            warnings.append("DPD: rate table anchor not found in sheet — carrier will be skipped")
+    else:
+        warnings.append("DPD: sheet not found — carrier will be skipped for all countries")
 
     # ── POSTNORD ─────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, *_PN_SHEET_NAMES)
@@ -653,9 +699,12 @@ def parse_rate_cards(excel_path):
         if data:
             out['POSTNORD'] = data
         else:
-            log.warning('POSTNORD sheet found but no rates parsed')
+            warnings.append("PostNord: sheet found but all four parsing strategies failed — "
+                            "check sheet structure (expected flat rates or From/To weight bands)")
+    else:
+        warnings.append("PostNord: sheet not found — carrier will be skipped for SE/DK/NO/FI")
 
-    return out
+    return out, warnings
 
 
 # ==============================================================================
@@ -1511,9 +1560,11 @@ def run_pipeline(input_path, country, output_dir='.',
     vl  = variables_layout or VARIABLES_LAYOUT
 
     log.info('=== Pipeline for %s ===', country)
-    parsed = parse_rate_cards(input_path)
-    return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl,
-                                    exceptions, overflow_rules, postcode_rules)
+    parsed, parse_warnings = parse_rate_cards(input_path)
+    result = run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl,
+                                      exceptions, overflow_rules, postcode_rules)
+    result['parse_warnings'] = parse_warnings
+    return result
 
 
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
