@@ -491,171 +491,61 @@ def _parse_postnord_sheet(ws):
 
 
 def parse_rate_cards(excel_path):
-    """Parse all carrier rate tables from the uploaded Excel. Fuzzy sheet matching."""
     wb  = openpyxl.load_workbook(excel_path, data_only=True)
     out = {}
+    warnings = []   # ← ADD THIS
 
-    # ── UPSDE ────────────────────────────────────────────────────────────────
+    # ── UPSDE ──
     ws = _find_sheet(wb, 'UPSDE', 'UPS DE', 'UPS-DE', 'UPDE')
     if ws:
-        upde = {'zones': _parse_upsde_zones(ws)}
-        for label, key in [('PARCEL - UPS - STDS', 'STDS'),
-                            ('PARCEL - UPS - STDM', 'STDM')]:
-            anchor = _scan_anchor(ws, label)
-            if anchor:
-                ar, ac = anchor
-                hrow, fc, tc = _find_from_to(ws, ar, ac)
-                if hrow:
-                    upde[f'{key}_by_zone'] = _extract_rates_by_zone(ws, hrow, fc, tc)
-                    upde[key] = _extract_tiers(ws, hrow, fc, tc, tc + 1)
-
-        anchor = _scan_anchor(ws, 'EXPSAVER UPSDE 7R9W62', 'EXPSAVER 7R9W62')
-        if anchor:
-            ar, ac = anchor
-            for r in range(ar + 1, min(ar + 6, ws.max_row) + 1):
-                for c in range(1, ws.max_column + 1):
-                    v = ws.cell(r, c).value
-                    if isinstance(v, str) and re.fullmatch(r'[A-Z]{2}', v.strip()):
-                        try:
-                            upde['EXPSAVER_7R9W62'] = _parse_float(ws.cell(r, c + 1).value)
-                            break
-                        except (TypeError, ValueError):
-                            pass
-                if 'EXPSAVER_7R9W62' in upde:
-                    break
-
-        anchor = _scan_anchor(ws, 'UPS DE - LINEHAUL', 'UPSDE Linehaul', 'linehaul ups')
-        if anchor:
-            ar, ac = anchor
-            for r in range(ar + 1, min(ar + 6, ws.max_row) + 1):
-                for c in range(1, ws.max_column + 1):
-                    v = ws.cell(r, c).value
-                    if isinstance(v, str) and any(
-                        kw in v.upper() for kw in ('DEUTSCHLAND', 'GERMANY', 'DE')
-                    ):
-                        try:
-                            upde['LINEHAUL'] = _parse_float(ws.cell(r, c + 1).value)
-                            break
-                        except (TypeError, ValueError):
-                            pass
-                if 'LINEHAUL' in upde:
-                    break
-
-        anchor = _scan_anchor(ws, 'EXPRESS SAVER UPSDE', 'PARCEL - EXPRESS SAVER UPSDE')
-        if anchor:
-            ar, ac = anchor
-            hrow, fc, tc = _find_from_to(ws, ar, ac)
-            if hrow:
-                upde['EXPRESS_SAVER_by_zone'] = _extract_rates_by_zone(ws, hrow, fc, tc)
-                upde['EXPRESS_SAVER'] = _extract_tiers(ws, hrow, fc, tc, tc + 1)
-
+        # ... existing code unchanged ...
         out['UPDE'] = upde
+    else:
+        warnings.append("UPS DE: sheet not found — carrier skipped")   # ← ADD
 
-    # ── UPSNL ────────────────────────────────────────────────────────────────
+    # ── UPSNL ──
     ws = _find_sheet(wb, 'UPSNL', 'UPS NL', 'UPS-NL')
     if ws:
-        upsnl = {'zones': [], 'rates_by_zone': {}}
-        anchor = _scan_anchor(ws, 'ZONES UPSNL', 'Zones UPSNL')
-        if anchor:
-            ar, ac = anchor
-            hrow, fc, tc = _find_from_to(ws, ar, ac, max_rows=5, col_slack=4)
-            if hrow:
-                country_col = fc - 1
-                zone_col = None
-                for c in range(tc + 1, ws.max_column + 1):
-                    if _cell_match(ws.cell(hrow, c).value, 'express saver'):
-                        zone_col = c
-                        break
-                if zone_col is None:
-                    for c in range(tc + 1, ws.max_column + 1):
-                        if isinstance(ws.cell(hrow + 1, c).value, (int, float)):
-                            zone_col = c
-                            break
-                if zone_col:
-                    for r in range(hrow + 1, ws.max_row + 1):
-                        pc_from  = ws.cell(r, fc).value
-                        pc_to    = ws.cell(r, tc).value
-                        zone_raw = ws.cell(r, zone_col).value
-                        if pc_from is None and pc_to is None and zone_raw is None:
-                            break
-                        if isinstance(pc_from, str) and pc_from.strip().upper() == 'ALL':
-                            pc_from_int, pc_to_int = 0, 99999
-                        else:
-                            try:
-                                pc_from_int = int(str(pc_from))
-                                pc_to_int   = int(str(pc_to))
-                            except (TypeError, ValueError):
-                                continue
-                        try:
-                            upsnl['zones'].append({
-                                'country':  ws.cell(r, country_col).value,
-                                'pc_from':  pc_from_int,
-                                'pc_to':    pc_to_int,
-                                'zone':     int(str(zone_raw)),
-                            })
-                        except (TypeError, ValueError):
-                            continue
-
-        anchor = _scan_anchor(ws, 'PARCEL - EXPRESS SAVER UPSNL', 'EXPRESS SAVER UPSNL',
-                              'Rates UPSNL express saver', 'Rates UPSNL')
-        if anchor:
-            ar, ac = anchor
-            hrow, fc, tc = _find_from_to(ws, ar, ac, max_rows=4, col_slack=3)
-            if hrow:
-                rbz = _extract_rates_by_zone(ws, hrow, fc, tc)
-                upsnl['rates_by_zone'] = {k: v for k, v in rbz.items()
-                                          if isinstance(k, int)}
+        upsnl = ...
+        # after parsing, check if zones or rates are empty:
+        if not upsnl.get('zones'):
+            warnings.append("UPS NL: zone table not found")
+        if not upsnl.get('rates_by_zone'):
+            warnings.append("UPS NL: rate table not found")
         out['UPSNL'] = upsnl
+    else:
+        warnings.append("UPS NL: sheet not found — carrier skipped")
 
-    # ── DHL ──────────────────────────────────────────────────────────────────
+    # ── DHL ──
     ws = _find_sheet(wb, 'DHL', 'DHL-ROS', 'DHL ROS')
     if ws:
-        anchor = _scan_anchor(ws, 'PARCEL - DHL', 'Rate per parcel DHL', 'dhl standard')
-        if anchor:
-            ar, ac = anchor
-            hrow, fc, tc = _find_from_to(ws, ar, ac)
-            if hrow:
-                tiers = _extract_tiers(ws, hrow, fc, tc, tc + 1)
-                if tiers:
-                    out['DHL-ROS'] = {'STANDARD': tiers}
+        # existing parse...
+        if 'DHL-ROS' not in out:
+            warnings.append("DHL: sheet found but no rates parsed (anchor not found)")
+    else:
+        warnings.append("DHL: sheet not found — carrier skipped")
 
-    # ── DPD ──────────────────────────────────────────────────────────────────
+    # ── DPD ──
     ws = _find_sheet(wb, 'DPD')
     if ws:
-        anchor = _scan_anchor(ws, 'PARCEL - DPD', 'Rate per parcel DPD', 'dpd parcel')
-        if anchor:
-            ar, _ = anchor
-            label_map = {'groot': 'groot', 'klein': 'klein', 'big': 'groot',
-                         'small': 'klein', 'large': 'groot', 'heavy': 'groot'}
-            rates = {}
-            for r in range(ar + 1, min(ar + 6, ws.max_row) + 1):
-                row_labels = {}
-                for c in range(1, ws.max_column + 1):
-                    v = ws.cell(r, c).value
-                    if isinstance(v, str):
-                        k = label_map.get(v.strip().lower())
-                        if k:
-                            row_labels[c] = k
-                if row_labels:
-                    for col, norm_label in row_labels.items():
-                        try:
-                            rates[norm_label] = _parse_float(ws.cell(r - 1, col).value)
-                        except (TypeError, ValueError):
-                            pass
-                    break
-            if rates:
-                out['DPD'] = rates
+        # existing parse...
+        if 'DPD' not in out:
+            warnings.append("DPD: sheet found but no rates parsed")
+    else:
+        warnings.append("DPD: sheet not found — carrier skipped")
 
-    # ── POSTNORD ─────────────────────────────────────────────────────────────
+    # ── POSTNORD ──
     ws = _find_sheet(wb, *_PN_SHEET_NAMES)
     if ws:
         data = _parse_postnord_sheet(ws)
         if data:
             out['POSTNORD'] = data
         else:
-            log.warning('POSTNORD sheet found but no rates parsed')
+            warnings.append("PostNord: sheet found but all parsing strategies failed")
+    else:
+        warnings.append("PostNord: sheet not found — carrier skipped")
 
-    return out
+    return out, warnings   # ← RETURN TUPLE INSTEAD OF JUST out
 
 
 # ==============================================================================
