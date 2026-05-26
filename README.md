@@ -4,7 +4,7 @@ A Streamlit app that turns a rate-card Excel into carrier pricing matrices.
 
 ## Files
 
-| File | Purpose |
+| File | Purpose | 
 |------|---------|
 | `app.py` | Streamlit UI — the only file managers interact with |
 | `pipeline.py` | Core logic: build, compute, optimize, write Excel |
