@@ -416,7 +416,7 @@ def parse_master_rate_card(path):
     if gb:
         master['UPSGB'] = gb
 
-    return master
+    return master, warnings
 
 
 # ==============================================================================
