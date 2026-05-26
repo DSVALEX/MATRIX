@@ -234,20 +234,38 @@ with st.sidebar:
                 tmp.write(uploaded.read())
                 st.session_state['input_path']  = tmp.name
                 st.session_state['uploaded_name'] = uploaded.name
-                st.session_state.pop('master', None)
+                # clear all stale state from the previous file
+                for key in ('master', 'parsed_per_country', 'parse_warnings',
+                            'country_overrides'):
+                    st.session_state.pop(key, None)
         input_path = st.session_state['input_path']
 
         is_master = mp.is_master_file(input_path)
         if is_master:
             if 'master' not in st.session_state:
                 with st.spinner("Reading master rate card…"):
-                    st.session_state['master'] = mp.parse_master_rate_card(input_path)
+                    master_data, parse_warnings = mp.parse_master_rate_card(input_path)
+                    st.session_state['master'] = master_data
+                    st.session_state['parse_warnings'] = parse_warnings
             master = st.session_state['master']
             avail = mp.available_countries(master)
             st.success(f"Master rate card detected — {len(avail)} countries available. "
                        "MAUT is read per-country from the file.")
         else:
+            if 'parsed_per_country' not in st.session_state:
+                with st.spinner("Reading rate card…"):
+                    parsed_data, parse_warnings = pl.parse_rate_cards(input_path)
+                    st.session_state['parsed_per_country'] = parsed_data
+                    st.session_state['parse_warnings'] = parse_warnings
             st.info("Per-country rate card detected.")
+
+    # Show any parse warnings collected during file read
+    parse_warnings = st.session_state.get('parse_warnings', [])
+    if parse_warnings:
+        with st.expander(f"⚠️ {len(parse_warnings)} parse warning(s) — click to review",
+                         expanded=True):
+            for w in parse_warnings:
+                st.warning(w)
 
     st.markdown('<p class="section-title">Fuel surcharge (%)</p>', unsafe_allow_html=True)
     fuel_vals = {}
@@ -437,6 +455,12 @@ if run_btn and uploaded and selected:
                 maut   = mp.country_maut(master, country)
                 cd = carrier_defaults(fuel_vals, maut['DHL-ROS'], maut['DPD'])
                 vl = variables_layout(fuel_vals, maut['DHL-ROS'], maut['DPD'])
+                # warn about any carrier in the country config that has no data
+                missing = [cid for cid in cfg['carriers'] if cid not in parsed]
+                if missing:
+                    for cid in missing:
+                        errors.setdefault(country, []).append(
+                            f"⚠️ {cid}: no rate data found for {country} — carrier skipped")
                 with tempfile.TemporaryDirectory() as tmp:
                     result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
                                                           exceptions=rules,
@@ -444,22 +468,33 @@ if run_btn and uploaded and selected:
                                                           postcode_rules=pc_rules)
                     result = persist(result)
             else:
+                parsed = st.session_state.get('parsed_per_country', {})
                 cd = carrier_defaults(fuel_vals, maut_dhl, maut_dpd)
                 vl = variables_layout(fuel_vals, maut_dhl, maut_dpd)
+                # warn about any carrier in the country config that has no data
+                missing = [cid for cid in cfg['carriers'] if cid not in parsed]
+                if missing:
+                    for cid in missing:
+                        errors.setdefault(country, []).append(
+                            f"⚠️ {cid}: no rate data found — carrier skipped")
                 with tempfile.TemporaryDirectory() as tmp:
-                    result = pl.run_pipeline(input_path, country, output_dir=tmp,
-                                             country_cfg=cfg, carrier_defaults=cd,
-                                             variables_layout=vl, exceptions=rules,
-                                             overflow_rules=ov_rules, postcode_rules=pc_rules)
+                    result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
+                                                          exceptions=rules,
+                                                          overflow_rules=ov_rules,
+                                                          postcode_rules=pc_rules)
                     result = persist(result)
 
             st.session_state.results[country] = result
         except Exception as e:
-            errors[country] = str(e)
+            errors.setdefault(country, []).append(str(e))
 
     progress.progress(1.0, text="Done.")
-    for country, msg in errors.items():
-        st.error(f"**{country}**: {msg}")
+    for country, msgs in errors.items():
+        for msg in (msgs if isinstance(msgs, list) else [msgs]):
+            if msg.startswith("⚠️"):
+                st.warning(f"**{country}**: {msg[2:].strip()}")
+            else:
+                st.error(f"**{country}**: {msg}")
 
 elif run_btn and not selected:
     st.warning("Please select at least one country.")
