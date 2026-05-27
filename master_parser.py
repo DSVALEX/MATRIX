@@ -114,7 +114,13 @@ def is_master_file(path):
 # ==============================================================================
 
 def _parse_upsde_zones(ws):
-    """ZONES UPSDE -> {ISO2: {'STDS':z, 'STDM':z, 'EXPRESS_SAVER':z}}."""
+    """ZONES UPSDE -> {ISO2: [{'pc_from':int, 'pc_to':int, 'STDS':z, 'STDM':z, 'EXPRESS_SAVER':z}, ...]}.
+
+    Returns a LIST of rows per country so that multiple postcode ranges are all
+    preserved. The old design stored one dict per ISO2 and silently dropped every
+    row after the first (out[iso] = entry overwrites), collapsing all zones to a
+    single entry. Italy for example has 3 zones: 00000-09999, 10000-50999, 51000-99999.
+    """
     hrow, from_col, to_col = _scan_from_to(ws)
     if not hrow:
         return {}
@@ -133,20 +139,28 @@ def _parse_upsde_zones(ws):
             break
 
     out = {}
+    last_iso = None
     for r in range(hrow + 1, ws.max_row + 1):
-        country = ws.cell(r, country_col).value
-        if not (isinstance(country, str) and _ISO2.fullmatch(country.strip())):
+        country_val = ws.cell(r, country_col).value
+        # Country column may be merged — carry forward last seen ISO2
+        if isinstance(country_val, str) and _ISO2.fullmatch(country_val.strip()):
+            last_iso = country_val.strip().upper()
+        if last_iso is None:
             continue
-        iso = country.strip().upper()
-        entry = {}
+        try:
+            pc_from = int(str(ws.cell(r, from_col).value))
+            pc_to   = int(str(ws.cell(r, to_col).value))
+        except (TypeError, ValueError):
+            continue
+        entry = {'pc_from': pc_from, 'pc_to': pc_to}
         for svc, col in svc_cols.items():
             v = ws.cell(r, col).value
             if isinstance(v, (int, float)):
                 entry[svc] = int(v)
             elif isinstance(v, str) and v.strip() and pl._norm(v) != 'on request':
                 entry[svc] = v.strip()
-        if entry:
-            out[iso] = entry
+        if len(entry) > 2:  # must have at least one zone assignment beyond pc_from/pc_to
+            out.setdefault(last_iso, []).append(entry)
     return out
 
 
@@ -328,10 +342,8 @@ def parse_master_rate_card(path):
     ws = sheet('ZONES UPSDE')
     if ws:
         master['UPSDE']['zones_by_country'] = _parse_upsde_zones(ws)
-        log.info('UPSDE zones parsed for countries: %s',
-                 sorted(master['UPSDE']['zones_by_country']))
-    for key, hint in [('STDS_by_zone',        'PARCEL - UPS - STDS'),
-                      ('STDM_by_zone',        'PARCEL - UPS - STDM'),
+    for key, hint in [('STDS_by_zone', 'PARCEL - UPS - STDS'),
+                      ('STDM_by_zone', 'PARCEL - UPS - STDM'),
                       ('EXPRESS_SAVER_by_zone', 'PARCEL - EXPRESS SAVER UPSDE')]:
         ws = sheet(hint)
         if ws:
@@ -383,7 +395,7 @@ def parse_master_rate_card(path):
     if ws:
         master['MAUT'] = _parse_maut(ws)
 
-    # ── UPSGB ────────────────────────────────────────────────────────────────
+    # ── UPSGB ──────────────────────────────────────────────────────────────────
     gb = {}
     ws = sheet('PARCEL - UPSGB - STDS')
     if ws: gb['STDS'] = _parse_gb_tiers(ws)
@@ -405,56 +417,22 @@ def parse_master_rate_card(path):
 
 def country_rate_data(master, iso2):
     """Return a parsed dict in the same shape parse_rate_cards() produces,
-    containing only the data relevant to `iso2`.
-
-    UPDE fallback: the UPSDE zones sheet only lists countries with multiple
-    postcode zones. Countries with a single flat zone may be absent. If that
-    happens but rate tables (STDS/STDM/EXPRESS_SAVER by zone) exist, we
-    synthesise a zone entry pointing at the first available zone key so
-    build_rows_upde can still fire. _upde_service_buckets detects a single
-    unique zone and collapses to POSTCODE=None automatically — correct behaviour
-    for a flat-zone country.
-    """
+    containing only the data relevant to `iso2`."""
     iso2 = iso2.upper()
     parsed = {}
 
     # ── UPDE ──────────────────────────────────────────────────────────────────
-    upsde        = master.get('UPSDE', {})
-    zbc          = upsde.get('zones_by_country', {}).get(iso2, {})
-    stds_by_zone = upsde.get('STDS_by_zone', {})
-    stdm_by_zone = upsde.get('STDM_by_zone', {})
-    exps_by_zone = upsde.get('EXPRESS_SAVER_by_zone', {})
+    upsde = master.get('UPSDE', {})
+    zone_rows = upsde.get('zones_by_country', {}).get(iso2, [])
     upde = {}
-
-    if zbc:
-        # Normal path: country is in the zones sheet with explicit zone numbers.
-        entry = {'country': iso2, 'pc_from': 0, 'pc_to': 99999}
-        entry.update(zbc)
-        upde['zones']                = [entry]
-        upde['STDS_by_zone']         = stds_by_zone
-        upde['STDM_by_zone']         = stdm_by_zone
-        upde['EXPRESS_SAVER_by_zone'] = exps_by_zone
-    elif stds_by_zone or stdm_by_zone or exps_by_zone:
-        # Fallback: country not in zones sheet (single flat zone).
-        # Pick the first zone key from whichever rate table exists.
-        fallback_zone = next(
-            iter(stds_by_zone or stdm_by_zone or exps_by_zone), 1
-        )
-        entry = {
-            'country':      iso2,
-            'pc_from':      0,
-            'pc_to':        99999,
-            'STDS':         fallback_zone,
-            'STDM':         fallback_zone,
-            'EXPRESS_SAVER': fallback_zone,
-        }
-        upde['zones']                = [entry]
-        upde['STDS_by_zone']         = stds_by_zone
-        upde['STDM_by_zone']         = stdm_by_zone
-        upde['EXPRESS_SAVER_by_zone'] = exps_by_zone
-        log.info('UPDE %s: not in zones sheet — using fallback zone %s (no postcode split)',
-                 iso2, fallback_zone)
-
+    if zone_rows:
+        # Pass every postcode range through as its own zone entry so that
+        # build_rows_upde sees the full zone table and produces postcode rows.
+        # The old code collapsed all ranges into one pc_from=0/pc_to=99999 entry.
+        upde['zones'] = [{'country': iso2, **row} for row in zone_rows]
+        upde['STDS_by_zone'] = upsde.get('STDS_by_zone', {})
+        upde['STDM_by_zone'] = upsde.get('STDM_by_zone', {})
+        upde['EXPRESS_SAVER_by_zone'] = upsde.get('EXPRESS_SAVER_by_zone', {})
     if iso2 in upsde.get('expsaver_7r9w62', {}):
         upde['EXPSAVER_7R9W62'] = upsde['expsaver_7r9w62'][iso2]
     if iso2 in upsde.get('wea', {}):
@@ -464,10 +442,10 @@ def country_rate_data(master, iso2):
 
     # ── UPSNL ──────────────────────────────────────────────────────────────────
     upsnl = master.get('UPSNL', {})
-    zone  = upsnl.get('zones_by_country', {}).get(iso2)
+    zone = upsnl.get('zones_by_country', {}).get(iso2)
     if zone is not None and upsnl.get('rates_by_zone'):
         parsed['UPSNL'] = {
-            'zones':        [{'country': iso2, 'pc_from': 0, 'pc_to': 99999, 'zone': zone}],
+            'zones': [{'country': iso2, 'pc_from': 0, 'pc_to': 99999, 'zone': zone}],
             'rates_by_zone': upsnl['rates_by_zone'],
         }
 
@@ -480,7 +458,7 @@ def country_rate_data(master, iso2):
 
     # ── DPD ────────────────────────────────────────────────────────────────────
     if iso2 in master.get('DPD', {}):
-        d   = master['DPD'][iso2]
+        d = master['DPD'][iso2]
         dpd = {}
         if d.get('normal') is not None:
             dpd['groot'] = d['normal']
