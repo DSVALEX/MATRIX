@@ -196,6 +196,89 @@ def postcode_rules_from_editor(edited_df):
     return rules
 
 
+
+def make_combined_excel(results):
+    """Stack all countries minimal matrices into one Matrix sheet.
+
+    Each country gets its own Variables_XX tab (e.g. Variables_DE, Variables_IT)
+    so MAUT — which differs per country — is always correct. Formulas in the
+    Matrix sheet are rewritten to reference the right Variables_XX tab per row.
+    """
+    import openpyxl as _ox
+    import re as _re
+    from openpyxl.styles import PatternFill
+
+    COLS = [
+        'SITE_ID', 'CLIENT_ID', 'CARRIER_ID', 'SERVICE_LEVEL', 'COUNTRYISO2',
+        'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
+        'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
+        'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD', 'RATE_BASE', 'RATE_EXTRA',
+        'FUEL', 'MAUT', 'Linehaul UPSDE', 'TOTAL_PRICE',
+    ]
+    COL_LETTER = {name: _ox.utils.get_column_letter(i + 1) for i, name in enumerate(COLS)}
+    BUCKET_FILL = PatternFill('solid', fgColor='FFF2CC')
+
+    if not results:
+        return b''
+
+    wb_out = _ox.Workbook()
+    ws_out = wb_out.active
+    ws_out.title = 'Matrix'
+    ws_out.append(COLS)
+
+    for country, r in results.items():
+        var_sheet = f'Variables_{country}'
+        wb_src = _ox.load_workbook(r['minimal'], data_only=False)
+        ws_src = wb_src.worksheets[0]  # matrix sheet is always first
+
+        # Copy Variables sheet as Variables_XX
+        if 'Variables' in wb_src.sheetnames:
+            vs_src = wb_src['Variables']
+            vs_dst = wb_out.create_sheet(var_sheet)
+            for row in vs_src.iter_rows(values_only=True):
+                vs_dst.append(list(row))
+
+        src_header = {ws_src.cell(1, c).value: c for c in range(1, ws_src.max_column + 1)}
+
+        for row_idx in range(2, ws_src.max_row + 1):
+            # Read raw cell values (formulas as strings, literals as values)
+            raw = {col: ws_src.cell(row_idx, src_header[col]).value
+                   if col in src_header else None for col in COLS}
+            if all(v is None for v in raw.values()):
+                continue  # skip trailing blank rows
+
+            # Detect bucket fill before appending
+            rb_cell = ws_src.cell(row_idx, src_header.get('RATE_BASE', 1))
+            is_bucket = (rb_cell.fill and rb_cell.fill.fgColor
+                         and rb_cell.fill.fgColor.rgb in ('FFFFF2CC', 'FFF2CC00'))
+
+            ws_out.append([raw[col] for col in COLS])
+            new_row = ws_out.max_row
+
+            # Rewrite formulas: replace Variables! with Variables_XX!
+            # and update row numbers from source row_idx to new_row
+            for ci, col in enumerate(COLS, start=1):
+                cell = ws_out.cell(new_row, ci)
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    formula = cell.value
+                    # Redirect Variables sheet reference
+                    formula = formula.replace('Variables!', f'{var_sheet}!')
+                    # Update all row references: letter + old_row_idx -> letter + new_row
+                    formula = _re.sub(
+                        rf'([A-Z]+){row_idx}',
+                        lambda m: f'{m.group(1)}{new_row}',
+                        formula
+                    )
+                    cell.value = formula
+
+                if is_bucket:
+                    cell.fill = BUCKET_FILL
+
+    buf = io.BytesIO()
+    wb_out.save(buf)
+    buf.seek(0)
+    return buf.read()
+
 def make_zip(results):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -348,7 +431,7 @@ if selected:
                 ov['carriers'] = st.multiselect("Carriers", list(pl.CARRIER_DEFAULTS),
                                                 default=ov['carriers'], key=f'car_{country}')
             with c2:
-                ov['max_parcel_count'] = st.number_input("Max parcels", 1, 30,
+                ov['max_parcel_count'] = st.number_input("Max parcels", 1, 20,
                                                          value=ov['max_parcel_count'], key=f'mp_{country}')
             with c3:
                 ov['max_each_weight_kg'] = st.number_input("Max kg", 1.0, 70.0,
@@ -520,3 +603,6 @@ if st.session_state.results:
     st.markdown("#### Download everything")
     st.download_button("📦 Download all countries as ZIP", data=make_zip(results),
                        file_name="rate_matrices.zip", mime="application/zip", type="primary")
+    st.download_button("📊 Download combined matrix (all countries)", data=make_combined_excel(results),
+                       file_name="rate_matrix_combined.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
