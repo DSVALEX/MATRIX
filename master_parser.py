@@ -114,12 +114,12 @@ def is_master_file(path):
 # ==============================================================================
 
 def _parse_upsde_zones(ws):
-    """ZONES UPSDE -> {ISO2: [{'pc_from':int, 'pc_to':int, 'STDS':z, 'STDM':z, 'EXPRESS_SAVER':z}, ...]}.
+    """ZONES UPSDE -> {ISO2: [{'pc_from':int, 'pc_to':int, 'STDS':z, ...}, ...]}.
 
-    Returns a LIST of rows per country so that multiple postcode ranges are all
-    preserved. The old design stored one dict per ISO2 and silently dropped every
-    row after the first (out[iso] = entry overwrites), collapsing all zones to a
-    single entry. Italy for example has 3 zones: 00000-09999, 10000-50999, 51000-99999.
+    Returns a LIST per country so all postcode ranges are preserved.
+    Italy has 3 zones (00000-09999, 10000-50999, 51000-99999); the old design
+    used out[iso] = entry which overwrote on every row, keeping only the last.
+    Handles merged country cells by carrying the last seen ISO2 forward.
     """
     hrow, from_col, to_col = _scan_from_to(ws)
     if not hrow:
@@ -142,7 +142,6 @@ def _parse_upsde_zones(ws):
     last_iso = None
     for r in range(hrow + 1, ws.max_row + 1):
         country_val = ws.cell(r, country_col).value
-        # Country column may be merged — carry forward last seen ISO2
         if isinstance(country_val, str) and _ISO2.fullmatch(country_val.strip()):
             last_iso = country_val.strip().upper()
         if last_iso is None:
@@ -159,7 +158,7 @@ def _parse_upsde_zones(ws):
                 entry[svc] = int(v)
             elif isinstance(v, str) and v.strip() and pl._norm(v) != 'on request':
                 entry[svc] = v.strip()
-        if len(entry) > 2:  # must have at least one zone assignment beyond pc_from/pc_to
+        if len(entry) > 2:  # at least one zone assignment beyond pc_from/pc_to
             out.setdefault(last_iso, []).append(entry)
     return out
 
@@ -426,9 +425,7 @@ def country_rate_data(master, iso2):
     zone_rows = upsde.get('zones_by_country', {}).get(iso2, [])
     upde = {}
     if zone_rows:
-        # Pass every postcode range through as its own zone entry so that
-        # build_rows_upde sees the full zone table and produces postcode rows.
-        # The old code collapsed all ranges into one pc_from=0/pc_to=99999 entry.
+        # Each row is {'pc_from':int, 'pc_to':int, 'STDS':z, 'STDM':z, ...}
         upde['zones'] = [{'country': iso2, **row} for row in zone_rows]
         upde['STDS_by_zone'] = upsde.get('STDS_by_zone', {})
         upde['STDM_by_zone'] = upsde.get('STDM_by_zone', {})
