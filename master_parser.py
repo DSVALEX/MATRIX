@@ -114,7 +114,13 @@ def is_master_file(path):
 # ==============================================================================
 
 def _parse_upsde_zones(ws):
-    """ZONES UPSDE -> {ISO2: {'STDS':z, 'STDM':z, 'EXPRESS_SAVER':z}}."""
+    """ZONES UPSDE -> {ISO2: [{'pc_from':int, 'pc_to':int, 'STDS':z, ...}, ...]}.
+
+    Returns a LIST per country so all postcode ranges are preserved.
+    Italy has 3 zones (00000-09999, 10000-50999, 51000-99999); the old design
+    used out[iso] = entry which overwrote on every row, keeping only the last.
+    Handles merged country cells by carrying the last seen ISO2 forward.
+    """
     hrow, from_col, to_col = _scan_from_to(ws)
     if not hrow:
         return {}
@@ -133,20 +139,33 @@ def _parse_upsde_zones(ws):
             break
 
     out = {}
+    last_iso = None
     for r in range(hrow + 1, ws.max_row + 1):
-        country = ws.cell(r, country_col).value
-        if not (isinstance(country, str) and _ISO2.fullmatch(country.strip())):
+        country_val = ws.cell(r, country_col).value
+        if isinstance(country_val, str) and _ISO2.fullmatch(country_val.strip()):
+            last_iso = country_val.strip().upper()
+        if last_iso is None:
             continue
-        iso = country.strip().upper()
-        entry = {}
+        from_raw = ws.cell(r, from_col).value
+        to_raw   = ws.cell(r, to_col).value
+        # 'ALL' means country has a single zone covering all postcodes (e.g. DE, FR, NL)
+        if isinstance(from_raw, str) and from_raw.strip().upper() == 'ALL':
+            pc_from, pc_to = 0, 99999
+        else:
+            try:
+                pc_from = int(str(from_raw))
+                pc_to   = int(str(to_raw)) if to_raw is not None else pc_from
+            except (TypeError, ValueError):
+                continue
+        entry = {'pc_from': pc_from, 'pc_to': pc_to}
         for svc, col in svc_cols.items():
             v = ws.cell(r, col).value
             if isinstance(v, (int, float)):
                 entry[svc] = int(v)
             elif isinstance(v, str) and v.strip() and pl._norm(v) != 'on request':
                 entry[svc] = v.strip()
-        if entry:
-            out[iso] = entry
+        if len(entry) > 2:  # at least one zone assignment beyond pc_from/pc_to
+            out.setdefault(last_iso, []).append(entry)
     return out
 
 
@@ -313,14 +332,8 @@ def _parse_linehaul(ws):
 # ==============================================================================
 
 def parse_master_rate_card(path):
-    """Parse the entire master workbook once into a structured dict.
-
-    Returns
-    -------
-    (dict, list)  — master data dict, list of human-readable warning strings.
-    """
+    """Parse the entire master workbook once into a structured dict."""
     wb = openpyxl.load_workbook(path, data_only=True)
-    warnings = []
 
     def sheet(*hints):
         return pl._find_sheet(wb, *hints)
@@ -334,12 +347,6 @@ def parse_master_rate_card(path):
     ws = sheet('ZONES UPSDE')
     if ws:
         master['UPSDE']['zones_by_country'] = _parse_upsde_zones(ws)
-        if not master['UPSDE']['zones_by_country']:
-            warnings.append("UPS DE: zone sheet found but no country zones parsed")
-    else:
-        warnings.append("UPS DE: zone sheet (ZONES UPSDE) not found")
-
-    stds_found = stdm_found = exps_found = False
     for key, hint in [('STDS_by_zone', 'PARCEL - UPS - STDS'),
                       ('STDM_by_zone', 'PARCEL - UPS - STDM'),
                       ('EXPRESS_SAVER_by_zone', 'PARCEL - EXPRESS SAVER UPSDE')]:
@@ -348,46 +355,20 @@ def parse_master_rate_card(path):
             hrow, fc, tc = _scan_from_to(ws)
             if hrow:
                 master['UPSDE'][key] = _extract_zone_tiers(ws, hrow, fc, tc)
-                if not master['UPSDE'][key]:
-                    warnings.append(f"UPS DE: sheet '{hint}' found but no zone tiers extracted")
-            else:
-                warnings.append(f"UPS DE: sheet '{hint}' found but no From/To header located")
-        else:
-            warnings.append(f"UPS DE: rate sheet '{hint}' not found")
-
     ws = sheet('PARCEL - EXPSAVER UPSDE 7R9W62')
     if ws:
         master['UPSDE']['expsaver_7r9w62'] = _flat_country_rates(ws)
-        if not master['UPSDE']['expsaver_7r9w62']:
-            warnings.append("UPS DE: ExpSaver 7R9W62 sheet found but no country rates parsed")
-    else:
-        warnings.append("UPS DE: ExpSaver 7R9W62 sheet not found — CH/NO flat rates unavailable")
-
     ws = sheet('PARCEL - UPS - WEA')
     if ws:
         master['UPSDE']['wea'] = _flat_country_rates(ws)
-        if not master['UPSDE']['wea']:
-            warnings.append("UPS DE: WEA sheet found but no country rates parsed")
-    else:
-        warnings.append("UPS DE: WEA sheet not found — WorldEase rates unavailable")
-
     ws = sheet('PARCEL - UPS DE - LINEHAUL', 'PARCEL - UPS - LINEHAUL')
     if ws:
         master['UPSDE']['linehaul'] = _parse_linehaul(ws)
-        if master['UPSDE']['linehaul'] is None:
-            warnings.append("UPS DE: linehaul sheet found but rate value not located")
-    else:
-        warnings.append("UPS DE: linehaul sheet not found — linehaul will use config default")
 
     # ── UPSNL ────────────────────────────────────────────────────────────────
     ws = sheet('ZONES UPSNL EXPRESS', 'ZONES UPSNL')
     if ws:
         master['UPSNL']['zones_by_country'] = _parse_upsnl_zones(ws)
-        if not master['UPSNL']['zones_by_country']:
-            warnings.append("UPS NL: zone sheet found but no country zones parsed")
-    else:
-        warnings.append("UPS NL: zone sheet not found — carrier will be skipped")
-
     ws = sheet('PARCEL - EXPRESS SAVER UPSNL')
     if ws:
         hrow, fc, tc = _scan_from_to(ws)
@@ -395,100 +376,44 @@ def parse_master_rate_card(path):
             rbz = _extract_zone_tiers(ws, hrow, fc, tc)
             master['UPSNL']['rates_by_zone'] = {k: v for k, v in rbz.items()
                                                 if isinstance(k, int)}
-            if not master['UPSNL']['rates_by_zone']:
-                warnings.append("UPS NL: Express Saver sheet found but no zone rates extracted")
-        else:
-            warnings.append("UPS NL: Express Saver sheet found but no From/To header located")
-    else:
-        warnings.append("UPS NL: Express Saver rate sheet not found — carrier will produce no rows")
 
     # ── DHL ──────────────────────────────────────────────────────────────────
     ws = sheet('PARCEL - DHL - Other countries')
     if ws:
         master['DHL']['other'] = _parse_dhl_other(ws)
-        if not master['DHL']['other']:
-            warnings.append("DHL: 'Other countries' sheet found but no country rates parsed")
-    else:
-        warnings.append("DHL: 'Other countries' sheet not found")
-
     ws = sheet('PARCEL - DHL - BNL')
     if ws:
         master['DHL']['bnl'] = _parse_dhl_bnl(ws)
-        if not master['DHL']['bnl']:
-            warnings.append("DHL: BNL sheet found but no rates parsed (BE/LU/NL may be missing)")
-    else:
-        warnings.append("DHL: BNL sheet not found — BE/LU/NL will fall back to 'other' rates")
-
-    if not master['DHL'].get('other') and not master['DHL'].get('bnl'):
-        warnings.append("DHL: no rate data found at all — carrier will be skipped for all countries")
 
     # ── DPD ──────────────────────────────────────────────────────────────────
     ws = sheet('PARCEL - DPD')
     if ws:
         master['DPD'] = _parse_dpd(ws)
-        if not master['DPD']:
-            warnings.append("DPD: sheet found but no country rates parsed")
-    else:
-        warnings.append("DPD: sheet not found — carrier will be skipped for all countries")
 
     # ── PostNord ──────────────────────────────────────────────────────────────
     ws = sheet('PARCEL - POSTNORD - STD', 'PARCEL - POSTNORD')
     if ws:
         master['POSTNORD'] = _parse_postnord(ws)
-        if not master['POSTNORD']:
-            warnings.append("PostNord: sheet found but no country rates parsed")
-    else:
-        warnings.append("PostNord: sheet not found — carrier will be skipped for SE/DK/NO/FI")
 
     # ── MAUT ──────────────────────────────────────────────────────────────────
     ws = sheet('MAUT SURCHARGE', 'MAUT')
     if ws:
         master['MAUT'] = _parse_maut(ws)
-        if not master['MAUT']:
-            warnings.append("MAUT: sheet found but no surcharge data parsed — 0% will be used")
-    else:
-        warnings.append("MAUT: surcharge sheet not found — 0% MAUT will be used for all countries")
 
     # ── UPSGB ──────────────────────────────────────────────────────────────────
     gb = {}
     ws = sheet('PARCEL - UPSGB - STDS')
-    if ws:
-        gb['STDS'] = _parse_gb_tiers(ws)
-        if not gb['STDS']:
-            warnings.append("UPS GB: STDS sheet found but no tiers parsed")
-    else:
-        warnings.append("UPS GB: STDS sheet not found")
-
+    if ws: gb['STDS'] = _parse_gb_tiers(ws)
     ws = sheet('PARCEL - UPSGB - STDM')
-    if ws:
-        gb['STDM'] = _parse_gb_tiers(ws)
-        if not gb['STDM']:
-            warnings.append("UPS GB: STDM sheet found but no tiers parsed")
-    else:
-        warnings.append("UPS GB: STDM sheet not found")
-
+    if ws: gb['STDM'] = _parse_gb_tiers(ws)
     ws = sheet('PARCEL - UPSGB - EXPS')
-    if ws:
-        gb['EXPS'] = _parse_gb_tiers(ws)
-        if not gb['EXPS']:
-            warnings.append("UPS GB: EXPS sheet found but no tiers parsed")
-    else:
-        warnings.append("UPS GB: EXPS sheet not found")
-
+    if ws: gb['EXPS'] = _parse_gb_tiers(ws)
     ws = sheet('PARCEL - UPS GB - LINEHAUL', 'PARCEL - UPSGB - LINEHAUL')
-    if ws:
-        gb['linehaul'] = _parse_linehaul(ws)
-        if gb['linehaul'] is None:
-            warnings.append("UPS GB: linehaul sheet found but rate value not located")
-    else:
-        warnings.append("UPS GB: linehaul sheet not found — GB linehaul will use config default")
-
+    if ws: gb['linehaul'] = _parse_linehaul(ws)
     if gb:
         master['UPSGB'] = gb
-    else:
-        warnings.append("UPS GB: no sheets found at all — GB will be skipped")
 
-    return master, warnings
+    return master
 
 
 # ==============================================================================
@@ -503,12 +428,11 @@ def country_rate_data(master, iso2):
 
     # ── UPDE ──────────────────────────────────────────────────────────────────
     upsde = master.get('UPSDE', {})
-    zbc = upsde.get('zones_by_country', {}).get(iso2, {})
+    zone_rows = upsde.get('zones_by_country', {}).get(iso2, [])
     upde = {}
-    if zbc:
-        entry = {'country': iso2, 'pc_from': 0, 'pc_to': 99999}
-        entry.update(zbc)
-        upde['zones'] = [entry]
+    if zone_rows:
+        # Each row is {'pc_from':int, 'pc_to':int, 'STDS':z, 'STDM':z, ...}
+        upde['zones'] = [{'country': iso2, **row} for row in zone_rows]
         upde['STDS_by_zone'] = upsde.get('STDS_by_zone', {})
         upde['STDM_by_zone'] = upsde.get('STDM_by_zone', {})
         upde['EXPRESS_SAVER_by_zone'] = upsde.get('EXPRESS_SAVER_by_zone', {})

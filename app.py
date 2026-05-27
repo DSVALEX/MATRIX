@@ -114,9 +114,6 @@ DEFAULT_EXCEPTIONS = pd.DataFrame([
 
 
 def exception_rules_from_editor(edited_df):
-    """Convert the data-editor rows into pipeline exception-rule dicts.
-    Constraint column (USER_DEF_TYPE_4) and flag (AWKWARD='y') are fixed to the
-    CargoWrite schema; size limit, surcharge and scope are the editable knobs."""
     rules = []
     for _, row in edited_df.iterrows():
         if not bool(row.get('Enabled', False)):
@@ -167,7 +164,7 @@ def overflow_rules_from_editor(edited_df):
             rate = float(row.get('Overflow rate €/parcel'))
         except (TypeError, ValueError):
             continue
-        if rate <= 0:          # overflow rate must be supplied (no guessing)
+        if rate <= 0:
             continue
         carrier = str(row.get('Carrier','') or '').strip()
         country = str(row.get('Country (blank=all)','') or '').strip().upper()
@@ -232,7 +229,7 @@ with st.sidebar:
         if st.session_state.get('uploaded_name') != uploaded.name:
             with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
                 tmp.write(uploaded.read())
-                st.session_state['input_path']  = tmp.name
+                st.session_state['input_path']    = tmp.name
                 st.session_state['uploaded_name'] = uploaded.name
                 # clear all stale state from the previous file
                 for key in ('master', 'parsed_per_country', 'parse_warnings',
@@ -244,9 +241,8 @@ with st.sidebar:
         if is_master:
             if 'master' not in st.session_state:
                 with st.spinner("Reading master rate card…"):
-                    master_data, parse_warnings = mp.parse_master_rate_card(input_path)
-                    st.session_state['master'] = master_data
-                    st.session_state['parse_warnings'] = parse_warnings
+                    st.session_state['master']         = mp.parse_master_rate_card(input_path)
+                    st.session_state['parse_warnings'] = []   # master parser logs via logging, not warnings list
             master = st.session_state['master']
             avail = mp.available_countries(master)
             st.success(f"Master rate card detected — {len(avail)} countries available. "
@@ -254,9 +250,8 @@ with st.sidebar:
         else:
             if 'parsed_per_country' not in st.session_state:
                 with st.spinner("Reading rate card…"):
-                    parsed_data, parse_warnings = pl.parse_rate_cards(input_path)
-                    st.session_state['parsed_per_country'] = parsed_data
-                    st.session_state['parse_warnings'] = parse_warnings
+                    st.session_state['parsed_per_country'] = pl.parse_rate_cards(input_path)
+                    st.session_state['parse_warnings']     = []
             st.info("Per-country rate card detected.")
 
     st.markdown('<p class="section-title">Fuel surcharge (%)</p>', unsafe_allow_html=True)
@@ -298,6 +293,7 @@ if _parse_warnings:
             st.warning(w)
 elif uploaded is not None:
     st.success("✅ All carriers parsed cleanly — no warnings.")
+
 if is_master and master is not None:
     avail = mp.available_countries(master)
     selectable = [c for c in ALL_COUNTRIES if c in avail]
@@ -318,9 +314,11 @@ ca, cb, *_ = st.columns([1, 1, 8])
 if ca.button("Select all"):
     for c in selectable:
         st.session_state.country_selection[c] = True
+        st.session_state[f'chk_{c}'] = True
 if cb.button("Clear"):
     for c in selectable:
         st.session_state.country_selection[c] = False
+        st.session_state[f'chk_{c}'] = False
 
 COLS = 10
 grid = st.columns(COLS)
@@ -441,7 +439,7 @@ if run_btn and uploaded and selected:
     st.session_state.results = {}
     input_path = st.session_state['input_path']
     errors = {}
-    rules = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
+    rules    = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
     ov_rules = overflow_rules_from_editor(st.session_state.get('overflow_df', DEFAULT_OVERFLOW))
     pc_rules = postcode_rules_from_editor(st.session_state.get('postcode_df', DEFAULT_POSTCODE))
     progress = st.progress(0, text="Starting…")
@@ -457,33 +455,29 @@ if run_btn and uploaded and selected:
                 maut   = mp.country_maut(master, country)
                 cd = carrier_defaults(fuel_vals, maut['DHL-ROS'], maut['DPD'])
                 vl = variables_layout(fuel_vals, maut['DHL-ROS'], maut['DPD'])
-                # warn about any carrier in the country config that has no data
                 missing = [cid for cid in cfg['carriers'] if cid not in parsed]
-                if missing:
-                    for cid in missing:
-                        errors.setdefault(country, []).append(
-                            f"⚠️ {cid}: no rate data found for {country} — carrier skipped")
+                for cid in missing:
+                    errors.setdefault(country, []).append(
+                        f"⚠️ {cid}: no rate data found for {country} — carrier skipped")
                 with tempfile.TemporaryDirectory() as tmp:
                     result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
-                                                          exceptions=rules,
-                                                          overflow_rules=ov_rules,
-                                                          postcode_rules=pc_rules)
+                                                         exceptions=rules,
+                                                         overflow_rules=ov_rules,
+                                                         postcode_rules=pc_rules)
                     result = persist(result)
             else:
                 parsed = st.session_state.get('parsed_per_country', {})
                 cd = carrier_defaults(fuel_vals, maut_dhl, maut_dpd)
                 vl = variables_layout(fuel_vals, maut_dhl, maut_dpd)
-                # warn about any carrier in the country config that has no data
                 missing = [cid for cid in cfg['carriers'] if cid not in parsed]
-                if missing:
-                    for cid in missing:
-                        errors.setdefault(country, []).append(
-                            f"⚠️ {cid}: no rate data found — carrier skipped")
+                for cid in missing:
+                    errors.setdefault(country, []).append(
+                        f"⚠️ {cid}: no rate data found — carrier skipped")
                 with tempfile.TemporaryDirectory() as tmp:
                     result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
-                                                          exceptions=rules,
-                                                          overflow_rules=ov_rules,
-                                                          postcode_rules=pc_rules)
+                                                         exceptions=rules,
+                                                         overflow_rules=ov_rules,
+                                                         postcode_rules=pc_rules)
                     result = persist(result)
 
             st.session_state.results[country] = result

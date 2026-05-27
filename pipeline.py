@@ -491,25 +491,14 @@ def _parse_postnord_sheet(ws):
 
 
 def parse_rate_cards(excel_path):
-    """Parse all carrier rate tables from the uploaded Excel. Fuzzy sheet matching.
-
-    Returns
-    -------
-    (dict, list)  — parsed rate data, list of human-readable warning strings.
-    Every missing sheet or failed parse appends a warning; callers should
-    surface these to the user rather than burying them in server logs.
-    """
-    wb       = openpyxl.load_workbook(excel_path, data_only=True)
-    out      = {}
-    warnings = []
+    """Parse all carrier rate tables from the uploaded Excel. Fuzzy sheet matching."""
+    wb  = openpyxl.load_workbook(excel_path, data_only=True)
+    out = {}
 
     # ── UPSDE ────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'UPSDE', 'UPS DE', 'UPS-DE', 'UPDE')
     if ws:
         upde = {'zones': _parse_upsde_zones(ws)}
-        if not upde['zones']:
-            warnings.append("UPS DE: zone table not found in sheet — postcode routing will be skipped")
-
         for label, key in [('PARCEL - UPS - STDS', 'STDS'),
                             ('PARCEL - UPS - STDM', 'STDM')]:
             anchor = _scan_anchor(ws, label)
@@ -519,10 +508,6 @@ def parse_rate_cards(excel_path):
                 if hrow:
                     upde[f'{key}_by_zone'] = _extract_rates_by_zone(ws, hrow, fc, tc)
                     upde[key] = _extract_tiers(ws, hrow, fc, tc, tc + 1)
-                else:
-                    warnings.append(f"UPS DE: found anchor '{label}' but no From/To header nearby")
-            else:
-                warnings.append(f"UPS DE: rate table '{label}' not found")
 
         anchor = _scan_anchor(ws, 'EXPSAVER UPSDE 7R9W62', 'EXPSAVER 7R9W62')
         if anchor:
@@ -565,8 +550,6 @@ def parse_rate_cards(excel_path):
                 upde['EXPRESS_SAVER'] = _extract_tiers(ws, hrow, fc, tc, tc + 1)
 
         out['UPDE'] = upde
-    else:
-        warnings.append("UPS DE: sheet not found — carrier will be skipped for all countries")
 
     # ── UPSNL ────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'UPSNL', 'UPS NL', 'UPS-NL')
@@ -612,12 +595,6 @@ def parse_rate_cards(excel_path):
                             })
                         except (TypeError, ValueError):
                             continue
-                else:
-                    warnings.append("UPS NL: zone table found but Express Saver zone column not identified")
-            else:
-                warnings.append("UPS NL: zone anchor found but no From/To header nearby")
-        else:
-            warnings.append("UPS NL: zone table not found — postcode routing will be skipped")
 
         anchor = _scan_anchor(ws, 'PARCEL - EXPRESS SAVER UPSNL', 'EXPRESS SAVER UPSNL',
                               'Rates UPSNL express saver', 'Rates UPSNL')
@@ -628,16 +605,7 @@ def parse_rate_cards(excel_path):
                 rbz = _extract_rates_by_zone(ws, hrow, fc, tc)
                 upsnl['rates_by_zone'] = {k: v for k, v in rbz.items()
                                           if isinstance(k, int)}
-                if not upsnl['rates_by_zone']:
-                    warnings.append("UPS NL: Express Saver rate table found but no zone rates parsed")
-            else:
-                warnings.append("UPS NL: Express Saver anchor found but no From/To header nearby")
-        else:
-            warnings.append("UPS NL: Express Saver rate table not found — carrier will produce no rows")
-
         out['UPSNL'] = upsnl
-    else:
-        warnings.append("UPS NL: sheet not found — carrier will be skipped for all countries")
 
     # ── DHL ──────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'DHL', 'DHL-ROS', 'DHL ROS')
@@ -650,14 +618,6 @@ def parse_rate_cards(excel_path):
                 tiers = _extract_tiers(ws, hrow, fc, tc, tc + 1)
                 if tiers:
                     out['DHL-ROS'] = {'STANDARD': tiers}
-                else:
-                    warnings.append("DHL: rate anchor and From/To found but no weight tiers extracted")
-            else:
-                warnings.append("DHL: rate anchor found but no From/To header nearby")
-        else:
-            warnings.append("DHL: rate table anchor not found in sheet — carrier will be skipped")
-    else:
-        warnings.append("DHL: sheet not found — carrier will be skipped for all countries")
 
     # ── DPD ──────────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, 'DPD')
@@ -685,12 +645,6 @@ def parse_rate_cards(excel_path):
                     break
             if rates:
                 out['DPD'] = rates
-            else:
-                warnings.append("DPD: rate anchor found but no groot/klein rates extracted")
-        else:
-            warnings.append("DPD: rate table anchor not found in sheet — carrier will be skipped")
-    else:
-        warnings.append("DPD: sheet not found — carrier will be skipped for all countries")
 
     # ── POSTNORD ─────────────────────────────────────────────────────────────
     ws = _find_sheet(wb, *_PN_SHEET_NAMES)
@@ -699,12 +653,9 @@ def parse_rate_cards(excel_path):
         if data:
             out['POSTNORD'] = data
         else:
-            warnings.append("PostNord: sheet found but all four parsing strategies failed — "
-                            "check sheet structure (expected flat rates or From/To weight bands)")
-    else:
-        warnings.append("PostNord: sheet not found — carrier will be skipped for SE/DK/NO/FI")
+            log.warning('POSTNORD sheet found but no rates parsed')
 
-    return out, warnings
+    return out
 
 
 # ==============================================================================
@@ -752,6 +703,16 @@ def collapse_same_rate_tiers(tiers, weight_cap=None):
 # ==============================================================================
 
 def _upde_service_buckets(rate_data, service_key, country_cfg):
+    """Return [(postcode_prefix_or_None, tiers), ...] for a UPDE service.
+
+    Postcode-resistance rules:
+    - No zones at all            → flat rate, no postcode column
+    - Zones but no pc_from/pc_to → treat as single zone, no postcode column
+    - All zones map to same rate → collapse to single entry, no postcode column
+    - Multiple distinct zones    → one entry per postcode prefix in range
+    - Prefix not covered by any  → falls back to the worst (highest-rate) zone
+      so no order is ever left unmatched
+    """
     zones   = rate_data.get('zones', [])
     by_zone = rate_data.get(f'{service_key}_by_zone', {})
     flat    = rate_data.get(service_key, [])
@@ -770,19 +731,32 @@ def _upde_service_buckets(rate_data, service_key, country_cfg):
             return by_zone.get(zid, [])
         return by_zone.get(zid) or flat
 
-    if len(unique_zones) == 1:
+    # If zones carry no pc_from/pc_to (old-style single-zone entry), treat as flat
+    has_pc_ranges = any('pc_from' in z and 'pc_to' in z for z in zones)
+    if not has_pc_ranges or len(unique_zones) == 1:
         return [(None, tiers_for(next(iter(unique_zones))))]
+
+    # Find the fallback: worst zone (highest rate at max weight)
+    def _zone_max_rate(zid):
+        t = tiers_for(zid)
+        return max((b['rate'] for b in t), default=0)
+    fallback_zid = max(unique_zones, key=_zone_max_rate)
 
     buckets = []
     for pc in range(pc_min, pc_max + 1):
         pc_full = pc * 1000
         zid = next((z[service_key] for z in zones
-                    if z['pc_from'] <= pc_full <= z['pc_to'] and service_key in z), None)
-        if zid is None:
-            continue
+                    if z.get('pc_from', 0) <= pc_full <= z.get('pc_to', 99999)
+                    and service_key in z), fallback_zid)
         t = tiers_for(zid)
         if t:
             buckets.append((pc, t))
+
+    # If all prefixes resolved to the same zone, collapse to no-postcode
+    if buckets and len({t_id for _, t_id in
+                        [(pc, id(t)) for pc, t in buckets]}) == 1:
+        return [(None, buckets[0][1])]
+
     return buckets
 
 
@@ -915,20 +889,56 @@ def build_rows_upsnl(rate_data, country_cfg):
                      'UPSNL', country_cfg['iso2'])
 
     zones = rate_data.get('zones', [])
-    prefix_to_zone = {}
-    for pc_prefix in range(pc_min, pc_max + 1):
-        pc_full = pc_prefix * 1000
-        for z in zones:
-            if z['pc_from'] <= pc_full <= z['pc_to']:
-                prefix_to_zone[pc_prefix] = z['zone']
-                break
-
     bands_by_zone = {z: collapse_same_rate_tiers(t, max_ew)
                      for z, t in rate_data.get('rates_by_zone', {}).items()}
 
+    # No zone table at all → no postcode, use zone 1 (or first available)
+    if not zones:
+        fallback_zone = next(iter(bands_by_zone), None)
+        if fallback_zone is None:
+            return rows
+        for each_w, rate, per_kg in bands_by_zone[fallback_zone]:
+            if each_w > max_ew or per_kg:
+                continue
+            for mp in range(1, max_p + 1):
+                rows.append({**c0, 'POSTCODE': None, 'SERVICE_LEVEL': 'EXPRESS SAVER',
+                             'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
+                             'RATE_BASE': round(rate * mp, 4)})
+        return rows
+
+    # Has pc_from/pc_to ranges → map each prefix to a zone
+    has_pc_ranges = any('pc_from' in z and 'pc_to' in z for z in zones)
+
+    if not has_pc_ranges:
+        # Single-zone entry without postcode ranges → no postcode column
+        zone = zones[0].get('zone')
+        for each_w, rate, per_kg in bands_by_zone.get(zone, []):
+            if each_w > max_ew or per_kg:
+                continue
+            for mp in range(1, max_p + 1):
+                rows.append({**c0, 'POSTCODE': None, 'SERVICE_LEVEL': 'EXPRESS SAVER',
+                             'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
+                             'RATE_BASE': round(rate * mp, 4)})
+        return rows
+
+    # Worst-zone fallback for prefixes not covered by the table
+    def _zone_max_rate(zid):
+        return max((r for _, r, _ in bands_by_zone.get(zid, [])), default=0)
+    all_zone_ids = [z['zone'] for z in zones if 'zone' in z]
+    fallback_zone = max(all_zone_ids, key=_zone_max_rate) if all_zone_ids else None
+
+    prefix_to_zone = {}
+    for pc_prefix in range(pc_min, pc_max + 1):
+        pc_full = pc_prefix * 1000
+        matched = next((z['zone'] for z in zones
+                        if z.get('pc_from', 0) <= pc_full <= z.get('pc_to', 99999)
+                        and 'zone' in z), fallback_zone)
+        if matched is not None:
+            prefix_to_zone[pc_prefix] = matched
+
     unique_zones = set(prefix_to_zone.values())
-    if len(unique_zones) == 1:
-        zone = next(iter(unique_zones))
+    if len(unique_zones) <= 1:
+        zone = next(iter(unique_zones), fallback_zone)
         for each_w, rate, per_kg in bands_by_zone.get(zone, []):
             if each_w > max_ew or per_kg:
                 continue
@@ -1083,7 +1093,9 @@ def compute_numeric_totals(df, carrier_defaults=None):
     ).round(4)
     df['Linehaul UPSDE'] = df.apply(
         lambda r: (cd[r['CARRIER_ID']]['linehaul_per_parcel'] * r['MAX_PARCEL']
-                   if cd[r['CARRIER_ID']]['linehaul_per_parcel'] > 0 else None),
+                   if cd[r['CARRIER_ID']]['linehaul_per_parcel'] > 0
+                   and r['MAX_PARCEL'] is not None
+                   and not pd.isna(r['MAX_PARCEL']) else None),
         axis=1,
     ).round(4)
 
@@ -1560,11 +1572,9 @@ def run_pipeline(input_path, country, output_dir='.',
     vl  = variables_layout or VARIABLES_LAYOUT
 
     log.info('=== Pipeline for %s ===', country)
-    parsed, parse_warnings = parse_rate_cards(input_path)
-    result = run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl,
-                                      exceptions, overflow_rules, postcode_rules)
-    result['parse_warnings'] = parse_warnings
-    return result
+    parsed = parse_rate_cards(input_path)
+    return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl,
+                                    exceptions, overflow_rules, postcode_rules)
 
 
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
