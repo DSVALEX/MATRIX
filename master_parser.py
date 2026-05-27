@@ -352,53 +352,41 @@ def parse_master_rate_card(path):
         'POSTNORD': {}, 'MAUT': {}, 'UPSGB': {},
     }
 
-    # ── UPSDE ────────────────────────────────────────────────────────────────
-    ws = sheet('ZONES UPSDE')
-    if ws:
-        master['UPSDE']['zones_by_country'] = _parse_upsde_zones(ws)
-        if not master['UPSDE']['zones_by_country']:
-            warnings.append("UPS DE: zone sheet found but no country zones parsed")
-    else:
-        warnings.append("UPS DE: zone sheet (ZONES UPSDE) not found")
-
-    for key, hint in [('STDS_by_zone', 'PARCEL - UPS - STDS'),
-                      ('STDM_by_zone', 'PARCEL - UPS - STDM'),
-                      ('EXPRESS_SAVER_by_zone', 'PARCEL - EXPRESS SAVER UPSDE')]:
-        ws = sheet(hint)
-        if ws:
-            hrow, fc, tc = _scan_from_to(ws)
-            if hrow:
-                master['UPSDE'][key] = _extract_zone_tiers(ws, hrow, fc, tc)
-                if not master['UPSDE'][key]:
-                    warnings.append(f"UPS DE: sheet '{hint}' found but no zone tiers extracted")
-            else:
-                warnings.append(f"UPS DE: sheet '{hint}' found but no From/To header located")
-        else:
-            warnings.append(f"UPS DE: rate sheet '{hint}' not found")
-
-    ws = sheet('PARCEL - EXPSAVER UPSDE 7R9W62')
-    if ws:
-        master['UPSDE']['expsaver_7r9w62'] = _flat_country_rates(ws)
-        if not master['UPSDE']['expsaver_7r9w62']:
-            warnings.append("UPS DE: ExpSaver 7R9W62 sheet found but no country rates parsed")
-    else:
-        warnings.append("UPS DE: ExpSaver 7R9W62 sheet not found — CH/NO flat rates unavailable")
-
-    ws = sheet('PARCEL - UPS - WEA')
-    if ws:
-        master['UPSDE']['wea'] = _flat_country_rates(ws)
-        if not master['UPSDE']['wea']:
-            warnings.append("UPS DE: WEA sheet found but no country rates parsed")
-    else:
-        warnings.append("UPS DE: WEA sheet not found — WorldEase rates unavailable")
-
-    ws = sheet('PARCEL - UPS DE - LINEHAUL', 'PARCEL - UPS - LINEHAUL')
-    if ws:
-        master['UPSDE']['linehaul'] = _parse_linehaul(ws)
-        if master['UPSDE']['linehaul'] is None:
-            warnings.append("UPS DE: linehaul sheet found but rate value not located")
-    else:
-        warnings.append("UPS DE: linehaul sheet not found — linehaul will use config default")
+   # ── UPDE ──────────────────────────────────────────────────────────────────
+    upsde = master.get('UPSDE', {})
+    zbc = upsde.get('zones_by_country', {}).get(iso2, {})
+    upde = {}
+    stds_by_zone  = upsde.get('STDS_by_zone', {})
+    stdm_by_zone  = upsde.get('STDM_by_zone', {})
+    exps_by_zone  = upsde.get('EXPRESS_SAVER_by_zone', {})
+    if zbc:
+        entry = {'country': iso2, 'pc_from': 0, 'pc_to': 99999}
+        entry.update(zbc)
+        upde['zones'] = [entry]
+        upde['STDS_by_zone'] = stds_by_zone
+        upde['STDM_by_zone'] = stdm_by_zone
+        upde['EXPRESS_SAVER_by_zone'] = exps_by_zone
+    elif stds_by_zone or stdm_by_zone or exps_by_zone:
+        # Country not in the zones sheet (single flat zone) — synthesise a
+        # zone-1 entry so build_rows_upde can still fire.  _upde_service_buckets
+        # detects only one unique zone and collapses to POSTCODE=None automatically.
+        fallback_zone = next(
+            iter(stds_by_zone or stdm_by_zone or exps_by_zone), 1
+        )
+        entry = {'country': iso2, 'pc_from': 0, 'pc_to': 99999,
+                 'STDS': fallback_zone, 'STDM': fallback_zone,
+                 'EXPRESS_SAVER': fallback_zone}
+        upde['zones'] = [entry]
+        upde['STDS_by_zone'] = stds_by_zone
+        upde['STDM_by_zone'] = stdm_by_zone
+        upde['EXPRESS_SAVER_by_zone'] = exps_by_zone
+        log.debug('UPDE %s: no zone mapping found, using fallback zone %s', iso2, fallback_zone)
+    if iso2 in upsde.get('expsaver_7r9w62', {}):
+        upde['EXPSAVER_7R9W62'] = upsde['expsaver_7r9w62'][iso2]
+    if iso2 in upsde.get('wea', {}):
+        upde['WEA'] = upsde['wea'][iso2]
+    if upde:
+        parsed['UPDE'] = upde
 
     # ── UPSNL ────────────────────────────────────────────────────────────────
     ws = sheet('ZONES UPSNL EXPRESS', 'ZONES UPSNL')
