@@ -1094,13 +1094,13 @@ def compute_numeric_totals(df, carrier_defaults=None):
     df['MAUT'] = df.apply(
         lambda r: cd[r['CARRIER_ID']]['maut_pct'] * r['RATE_BASE'], axis=1
     ).round(4)
-    df['Linehaul UPSDE'] = df.apply(
+    df['Linehaul UPSDE'] = pd.to_numeric(df.apply(
         lambda r: (cd[r['CARRIER_ID']]['linehaul_per_parcel'] * r['MAX_PARCEL']
                    if cd[r['CARRIER_ID']]['linehaul_per_parcel'] > 0
                    and r['MAX_PARCEL'] is not None
                    and not pd.isna(r['MAX_PARCEL']) else None),
         axis=1,
-    ).round(4)
+    ), errors='coerce').round(4)
 
     vdiv = lambda r: cd[r['CARRIER_ID']]['volume_divisor']
     df['MAX_VOLUME']  = df.apply(lambda r: r['MAX_WEIGHT'] / vdiv(r), axis=1)
