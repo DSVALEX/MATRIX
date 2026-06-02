@@ -1753,13 +1753,15 @@ PALLET_COUNTRY_OVERRIDES = {
 
 # Per-country MAUT as a % of RATE_BASE, with an optional 2nd tier above a weight
 # breakpoint:  (low_pct, high_pct, tier_kg)  — high_pct applies when band ceiling
-# > tier_kg. KNOWN values come straight from the reference matrix Variables sheet.
-# Countries absent here default to 0 MAUT and raise a warning (never guessed).
-PALLET_MAUT = {
-    'DE': (0.0253, 0.0544, 2500),
-    'IT': (0.0253, 0.0253, 2500),
-    'FR': (0.0,    0.0,     2500),
-}
+# > tier_kg. Source: DSV pallet MAUT list (S2026). Low tier is 2.53% everywhere;
+# the high tier (>2500 kg, up to FTL) is 5.44% for the road-toll countries below
+# and 2.53% (flat) for the rest. Countries absent here default to 0 MAUT and raise
+# a warning (never guessed).
+PALLET_MAUT = {iso: (0.0253, 0.0544, 2500) for iso in
+               ('AT', 'CH', 'CZ', 'DE', 'HR', 'HU', 'PL', 'SI', 'SK')}
+PALLET_MAUT.update({iso: (0.0253, 0.0253, 2500) for iso in
+                    ('BA', 'BG', 'DK', 'EE', 'FI', 'GR', 'IT', 'LT', 'LU', 'LV',
+                     'MK', 'NO', 'RO', 'RS', 'SE', 'TR')})
 
 # Extra columns pallet rows carry, in the reference file's order.
 PALLET_COLUMN_ORDER = [
