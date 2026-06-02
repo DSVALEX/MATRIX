@@ -1762,6 +1762,10 @@ PALLET_MAUT = {iso: (0.0253, 0.0544, 2500) for iso in
 PALLET_MAUT.update({iso: (0.0253, 0.0253, 2500) for iso in
                     ('BA', 'BG', 'DK', 'EE', 'FI', 'GR', 'IT', 'LT', 'LU', 'LV',
                      'MK', 'NO', 'RO', 'RS', 'SE', 'TR')})
+# Confirmed by Fender logistics: these countries are genuinely 0% MAUT.
+# Listed explicitly so they price correctly and stop firing "MAUT unknown" warnings.
+PALLET_MAUT.update({iso: (0.0, 0.0, 2500) for iso in
+                    ('BE', 'ES', 'FR', 'GB', 'IE', 'MT', 'NL', 'PT')})
 
 # Extra columns pallet rows carry, in the reference file's order.
 PALLET_COLUMN_ORDER = [
