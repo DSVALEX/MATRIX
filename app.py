@@ -127,7 +127,7 @@ DEFAULT_EXCEPTIONS = pd.DataFrame([
      'Size limit (m)': 1.5,  'Surcharge €/parcel': 6.0},
     {'Enabled': True, 'Carrier': 'DPD',  'Country (blank=all)': '',
      'Service level (blank=all)': '',
-     'Size limit (m)': 1.75, 'Surcharge €/parcel': 6.0},
+     'Size limit (m)': 1.75, 'Surcharge €/parcel': 46.5},
 ])
 
 
