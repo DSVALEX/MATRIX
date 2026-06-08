@@ -6,6 +6,9 @@ Supports two input formats, auto-detected on upload:
     in one file). MAUT is read per-country from the file automatically.
   • Per-country file — the older one-country-per-workbook format.
 
+Optional pallet rate card (DHL-FENDER / EUROCONNECT) can be uploaded alongside;
+pallet rows are merged into every selected country's matrix.
+
 Run locally:   streamlit run app.py
 Deploy:        push to GitHub, connect on share.streamlit.io
 """
@@ -23,6 +26,7 @@ import streamlit as st
 
 import pipeline as pl
 import master_parser as mp
+import pallet_parser as pp
 
 st.set_page_config(page_title="Rate Matrix Builder", page_icon="📦",
                    layout="wide", initial_sidebar_state="expanded")
@@ -38,14 +42,6 @@ st.markdown("""
 
 logging.basicConfig(level=logging.INFO)
 
-# Bump this any time master_parser changes its output format.
-# Forces all connected sessions to re-parse on next upload.
-_PARSER_VERSION = '2'
-if st.session_state.get('_parser_version') != _PARSER_VERSION:
-    for key in ('master', 'parsed_per_country', 'parse_warnings', 'input_path', 'uploaded_file_key', 'uploaded_name'):
-        st.session_state.pop(key, None)
-    st.session_state['_parser_version'] = _PARSER_VERSION
-
 ALL_COUNTRIES  = sorted(pl.COUNTRY_CONFIG.keys())
 CARRIER_LABELS = {cid: cfg['label'] for cid, cfg in pl.CARRIER_DEFAULTS.items()}
 FUEL_CARRIERS  = ['UPDE', 'DHL-ROS', 'DPD', 'UPSNL', 'POSTNORD', 'UPSGB']
@@ -59,17 +55,24 @@ def _pct_input(label, key, default):
                            value=float(default), step=0.01, format="%.2f", key=key)
 
 
-def variables_layout(fuel_vals, maut_dhl, maut_dpd):
+def variables_layout(fuel_vals, maut_dhl, maut_dpd, pallet_vals=None):
+    pv = pallet_vals or {}
     return [
-        ('FUEL UPSDE',    fuel_vals.get('UPDE',     0.27)),
-        ('FUEL DHL',      fuel_vals.get('DHL-ROS',  0.27)),
-        ('FUEL DPD',      fuel_vals.get('DPD',      0.27)),
-        ('FUEL UPSNL',    fuel_vals.get('UPSNL',    0.27)),
-        ('FUEL POSTNORD', fuel_vals.get('POSTNORD', 0.27)),
-        ('FUEL UPSGB',    fuel_vals.get('UPSGB',    0.27)),
-        (None, None),
-        ('MAUT DPD',      maut_dpd),
-        ('MAUT DHL',      maut_dhl),
+        ('FUEL UPSDE',    fuel_vals.get('UPDE',     0.27)),   # B1
+        ('FUEL DHL',      fuel_vals.get('DHL-ROS',  0.27)),   # B2
+        ('FUEL DPD',      fuel_vals.get('DPD',      0.27)),   # B3
+        ('FUEL UPSNL',    fuel_vals.get('UPSNL',    0.27)),   # B4
+        ('FUEL POSTNORD', fuel_vals.get('POSTNORD', 0.27)),   # B5
+        ('FUEL UPSGB',    fuel_vals.get('UPSGB',    0.27)),   # B6
+        (None, None),                                         # B7
+        ('MAUT DPD',      maut_dpd),                          # B8
+        ('MAUT DHL',      maut_dhl),                          # B9
+        (None, None),                                         # B10
+        ('FUEL DHL PALLET', pv.get('fuel',     0.155)),       # B11
+        ('MOBILITY PALLET', pv.get('mobility', 0.04)),        # B12
+        ('TOLL UK PALLET',  pv.get('toll',     0.0043)),      # B13
+        ('ADMIN PALLET',    pv.get('admin',    46.51)),       # B14
+        ('FACTOR DHL',      pv.get('factor',   1.0)),         # B15
     ]
 
 
@@ -106,6 +109,11 @@ def persist(result):
         dst = Path(out) / Path(result[key]).name
         shutil.copy(result[key], dst)
         result[key] = str(dst)
+    # Carry the minimal numeric frame (used to build the combined workbook)
+    if result.get('minimal_df'):
+        dst = Path(out) / Path(result['minimal_df']).name
+        shutil.copy(result['minimal_df'], dst)
+        result['minimal_df'] = str(dst)
     return result
 
 
@@ -115,9 +123,11 @@ def file_bytes(p):
 
 DEFAULT_EXCEPTIONS = pd.DataFrame([
     {'Enabled': True, 'Carrier': 'UPDE', 'Country (blank=all)': '',
+     'Service level (blank=all)': 'STANDARD',
      'Size limit (m)': 1.5,  'Surcharge €/parcel': 6.0},
     {'Enabled': True, 'Carrier': 'DPD',  'Country (blank=all)': '',
-     'Size limit (m)': 1.75, 'Surcharge €/parcel': 6.0},
+     'Service level (blank=all)': '',
+     'Size limit (m)': 1.75, 'Surcharge €/parcel': 46.5},
 ])
 
 
@@ -128,6 +138,7 @@ def exception_rules_from_editor(edited_df):
             continue
         carrier = str(row.get('Carrier', '') or '').strip()
         country = str(row.get('Country (blank=all)', '') or '').strip().upper()
+        service = str(row.get('Service level (blank=all)', '') or '').strip().upper()
         try:
             limit = float(row.get('Size limit (m)'))
         except (TypeError, ValueError):
@@ -141,11 +152,10 @@ def exception_rules_from_editor(edited_df):
             'label':          f'Oversize {carrier or "ALL"}',
             'carriers':       [carrier] if carrier and carrier != '(all)' else [],
             'countries':      [c.strip() for c in country.split(',') if c.strip()],
+            'service_levels': [s.strip() for s in service.split(',') if s.strip()],
             'constraint_col': 'USER_DEF_TYPE_4 (max 1,5m)',
             'normal_value':   limit,
             'bucket_value':   None,
-            'flag_col':       'AWKWARD',
-            'flag_value':     'y',
             'surcharge':      sur,
             'surcharge_mode': 'per_parcel',
         })
@@ -182,7 +192,6 @@ def overflow_rules_from_editor(edited_df):
             'countries': [c.strip() for c in country.split(',') if c.strip()],
             'overflow_rate': rate,
             'surcharge': float(row.get('Surcharge €/parcel') or 0),
-            'flag_col': 'AWKWARD', 'flag_value': 'Y',
         })
     return rules
 
@@ -199,92 +208,34 @@ def postcode_rules_from_editor(edited_df):
             'carriers': [carrier] if carrier and carrier != '(all)' else [],
             'countries': [c.strip() for c in country.split(',') if c.strip()],
             'surcharge': float(row.get('Surcharge €') or 0),
-            'flag_col': 'AWKWARD', 'flag_value': 'Y',
         })
     return rules
 
 
-def make_combined_excel(results):
-    """Stack all countries minimal matrices into one Matrix sheet.
+# ── Pallet MAUT editor helpers ────────────────────────────────────────────────
 
-    Each country gets its own Variables_XX tab (e.g. Variables_DE, Variables_IT)
-    so MAUT — which differs per country — is always correct. Formulas in the
-    Matrix sheet are rewritten to reference the right Variables_XX tab per row.
-    """
-    import openpyxl as _ox
-    import re as _re
-    from openpyxl.styles import PatternFill
+def _default_pallet_maut_df():
+    rows = []
+    for iso, (low, high, tier) in pl.PALLET_MAUT.items():
+        rows.append({'Country': iso, 'MAUT % (≤ tier)': low,
+                     'MAUT % (> tier)': high, 'Tier kg': tier})
+    return pd.DataFrame(rows)
 
-    COLS = [
-        'SITE_ID', 'CLIENT_ID', 'CARRIER_ID', 'SERVICE_LEVEL', 'COUNTRYISO2',
-        'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
-        'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
-        'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD', 'RATE_BASE', 'RATE_EXTRA',
-        'FUEL', 'MAUT', 'Linehaul UPSDE', 'TOTAL_PRICE',
-    ]
-    COL_LETTER = {name: _ox.utils.get_column_letter(i + 1) for i, name in enumerate(COLS)}
-    BUCKET_FILL = PatternFill('solid', fgColor='FFF2CC')
 
-    if not results:
-        return b''
-
-    wb_out = _ox.Workbook()
-    ws_out = wb_out.active
-    ws_out.title = 'Matrix'
-    ws_out.append(COLS)
-
-    for country, r in results.items():
-        var_sheet = f'Variables_{country}'
-        wb_src = _ox.load_workbook(r['minimal'], data_only=False)
-        ws_src = wb_src.worksheets[0]  # matrix sheet is always first
-
-        # Copy Variables sheet as Variables_XX
-        if 'Variables' in wb_src.sheetnames:
-            vs_src = wb_src['Variables']
-            vs_dst = wb_out.create_sheet(var_sheet)
-            for row in vs_src.iter_rows(values_only=True):
-                vs_dst.append(list(row))
-
-        src_header = {ws_src.cell(1, c).value: c for c in range(1, ws_src.max_column + 1)}
-
-        for row_idx in range(2, ws_src.max_row + 1):
-            # Read raw cell values (formulas as strings, literals as values)
-            raw = {col: ws_src.cell(row_idx, src_header[col]).value
-                   if col in src_header else None for col in COLS}
-            if all(v is None for v in raw.values()):
-                continue  # skip trailing blank rows
-
-            # Detect bucket fill before appending
-            rb_cell = ws_src.cell(row_idx, src_header.get('RATE_BASE', 1))
-            is_bucket = (rb_cell.fill and rb_cell.fill.fgColor
-                         and rb_cell.fill.fgColor.rgb in ('FFFFF2CC', 'FFF2CC00'))
-
-            ws_out.append([raw[col] for col in COLS])
-            new_row = ws_out.max_row
-
-            # Rewrite formulas: replace Variables! with Variables_XX!
-            # and update row numbers from source row_idx to new_row
-            for ci, col in enumerate(COLS, start=1):
-                cell = ws_out.cell(new_row, ci)
-                if isinstance(cell.value, str) and cell.value.startswith('='):
-                    formula = cell.value
-                    # Redirect Variables sheet reference
-                    formula = formula.replace('Variables!', f'{var_sheet}!')
-                    # Update all row references: letter + old_row_idx -> letter + new_row
-                    formula = _re.sub(
-                        rf'([A-Z]+){row_idx}',
-                        lambda m: f'{m.group(1)}{new_row}',
-                        formula
-                    )
-                    cell.value = formula
-
-                if is_bucket:
-                    cell.fill = BUCKET_FILL
-
-    buf = io.BytesIO()
-    wb_out.save(buf)
-    buf.seek(0)
-    return buf.read()
+def pallet_maut_from_editor(edited_df):
+    table = {}
+    for _, row in edited_df.iterrows():
+        iso = str(row.get('Country', '') or '').strip().upper()
+        if not iso:
+            continue
+        try:
+            low  = float(row.get('MAUT % (≤ tier)') or 0)
+            high = float(row.get('MAUT % (> tier)') or 0)
+            tier = float(row.get('Tier kg') or 2500)
+        except (TypeError, ValueError):
+            continue
+        table[iso] = (low, high, tier)
+    return table
 
 
 def make_zip(results):
@@ -297,6 +248,39 @@ def make_zip(results):
                 zf.write(r[key], f'{country}/{country}_Matrix_{label}.xlsx')
     buf.seek(0)
     return buf.read()
+
+
+def make_combined(results, variables_layout_rows, pallet_maut=None,
+                  pallet_defaults=None, carrier_defaults=None):
+    """Build ONE workbook with every country's minimal matrix in a single sheet,
+    with live formulas (per-country pallet MAUT cells written into Variables)."""
+    frames = []
+    for country, r in results.items():
+        p = r.get('minimal_df')
+        if p and Path(p).exists():
+            try:
+                frames.append(pd.read_pickle(p))
+            except Exception:
+                pass
+    if not frames:
+        return None
+    out = Path(tempfile.mkdtemp()) / 'Combined_Matrix_minimal.xlsx'
+    # Numeric (formulas=False): the combined sheet has ONE shared Variables sheet,
+    # which cannot represent per-country MAUT. Writing the already-correct
+    # per-country numeric values is the only way to keep DPD/DHL MAUT right for
+    # every country in a single sheet.
+    # The single MAUT DPD / MAUT DHL cells are unused in the numeric combined
+    # (MAUT is baked per-row); blank them with a note so the Variables tab doesn't
+    # read like a flat 5%/6% is being applied.
+    vl_combined = [
+        (name, ('per country — see MAUT column' if name in ('MAUT DPD', 'MAUT DHL')
+                else val))
+        for name, val in variables_layout_rows
+    ]
+    pl.write_combined_matrix(frames, out, vl_combined,
+                             pallet_maut=pallet_maut, pallet_defaults=pallet_defaults,
+                             carrier_defaults=carrier_defaults, formulas=False)
+    return Path(out).read_bytes()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -312,18 +296,14 @@ with st.sidebar:
                                 help="Upload the DSV master rate card, or an older "
                                      "per-country file. The format is detected automatically.")
 
-    # Detect master vs per-country (cache parse in session)
     is_master = False
     master = None
     if uploaded is not None:
-        # Save bytes once; reuse across reruns
-        file_cache_key = f'{uploaded.name}:{uploaded.size}'
-        if st.session_state.get('uploaded_file_key') != file_cache_key:
+        if st.session_state.get('uploaded_name') != uploaded.name:
             with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
                 tmp.write(uploaded.read())
-                st.session_state['input_path']        = tmp.name
-                st.session_state['uploaded_file_key'] = file_cache_key
-                # clear all stale state from the previous file
+                st.session_state['input_path']    = tmp.name
+                st.session_state['uploaded_name'] = uploaded.name
                 for key in ('master', 'parsed_per_country', 'parse_warnings',
                             'country_overrides'):
                     st.session_state.pop(key, None)
@@ -334,7 +314,7 @@ with st.sidebar:
             if 'master' not in st.session_state:
                 with st.spinner("Reading master rate card…"):
                     st.session_state['master']         = mp.parse_master_rate_card(input_path)
-                    st.session_state['parse_warnings'] = []   # master parser logs via logging, not warnings list
+                    st.session_state['parse_warnings'] = []
             master = st.session_state['master']
             avail = mp.available_countries(master)
             st.success(f"Master rate card detected — {len(avail)} countries available. "
@@ -346,6 +326,30 @@ with st.sidebar:
                     st.session_state['parse_warnings']     = []
             st.info("Per-country rate card detected.")
 
+    # ── Pallet rate card (optional, separate file) ────────────────────────────
+    st.markdown('<p class="section-title">Pallet rate card (optional)</p>',
+                unsafe_allow_html=True)
+    pallet_uploaded = st.file_uploader(
+        "Upload DHL pallet Excel", type=["xlsx", "xls"],
+        label_visibility="collapsed", key="pallet_uploader",
+        help="Upload the DHL pallet rate card (Country/Zip × weight bands). "
+             "Pallet rows (carrier DHL-FENDER) are added for every selected "
+             "country that has pallet data.")
+    if pallet_uploaded is not None:
+        if st.session_state.get('pallet_uploaded_name') != pallet_uploaded.name:
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                tmp.write(pallet_uploaded.read())
+                st.session_state['pallet_path']          = tmp.name
+                st.session_state['pallet_uploaded_name'] = pallet_uploaded.name
+                st.session_state.pop('pallets', None)
+        if 'pallets' not in st.session_state:
+            with st.spinner("Reading pallet rate card…"):
+                # canonical name in pallet_parser; alias parse_pallet_rate_card also works
+                st.session_state['pallets'] = pp.parse_pallet_factor_file(
+                    st.session_state['pallet_path'])
+        _pcount = len(pp.available_pallet_countries(st.session_state['pallets']))
+        st.success(f"Pallet card loaded — {_pcount} countries with pallet rates.")
+
     st.markdown('<p class="section-title">Fuel surcharge (%)</p>', unsafe_allow_html=True)
     fuel_vals = {}
     cols = st.columns(2)
@@ -354,7 +358,6 @@ with st.sidebar:
             fuel_vals[cid] = _pct_input(CARRIER_LABELS[cid], f'fuel_{cid}',
                                         pl.CARRIER_DEFAULTS[cid]['fuel_pct'])
 
-    # MAUT inputs only matter for per-country files (master reads MAUT itself)
     maut_dhl = pl.CARRIER_DEFAULTS['DHL-ROS']['maut_pct']
     maut_dpd = pl.CARRIER_DEFAULTS['DPD']['maut_pct']
     if not is_master:
@@ -364,6 +367,58 @@ with st.sidebar:
             maut_dpd = _pct_input('DPD', 'maut_DPD', maut_dpd)
         with cols[1]:
             maut_dhl = _pct_input('DHL', 'maut_DHL', maut_dhl)
+
+    # Pallet surcharge inputs — only shown when a pallet card is loaded
+    pallet_vals = {}
+    pallet_maut_table = dict(pl.PALLET_MAUT)
+    pallet_max_band_kg = 0          # 0 = no cap; set by the control below
+    if st.session_state.get('pallets'):
+        st.markdown('<p class="section-title">Pallet surcharges (DHL-FENDER)</p>',
+                    unsafe_allow_html=True)
+        _pd = pl.PALLET_DEFAULTS['DHL-FENDER']
+        cols = st.columns(2)
+        with cols[0]:
+            pallet_vals['fuel'] = _pct_input('Fuel %', 'pal_fuel', _pd['fuel_pct'])
+        with cols[1]:
+            pallet_vals['mobility'] = _pct_input('Mobility %', 'pal_mob', _pd['mobility_pct'])
+        cols = st.columns(2)
+        with cols[0]:
+            pallet_vals['toll'] = st.number_input(
+                'UK toll %', min_value=0.0, max_value=1.0,
+                value=float(pl.PALLET_COUNTRY_OVERRIDES.get('GB', {}).get('toll_pct', 0.0043)),
+                step=0.0001, format="%.4f", key='pal_toll')
+        with cols[1]:
+            pallet_vals['admin'] = st.number_input(
+                'Admin € / shipment', min_value=0.0,
+                value=float(_pd['admin_per_shipment']), step=1.0, format="%.2f", key='pal_admin')
+        pallet_vals['factor'] = st.number_input(
+            'Factor (× pallet rate)', min_value=0.0001,
+            value=float(_pd['factor']), step=0.01, format="%.4f", key='pal_factor')
+        pallet_max_band_kg = st.number_input(
+            'Max pallet weight (kg)  —  0 = no cap', min_value=0,
+            value=0, step=500, key='pal_max_band',
+            help="Drops every rate-card weight band whose ceiling is above this. "
+                 "Bands step 3500 → 4000 → 4500 …, so e.g. 4025 keeps bands up to "
+                 "4000 kg (the 4000,1–4500 band is dropped); 4500 keeps that band. "
+                 "0 keeps all bands (currently up to 23000 kg).")
+
+        st.markdown('<p class="section-title">Pallet MAUT (% of rate)</p>',
+                    unsafe_allow_html=True)
+        st.caption("Per country. Low = ≤ tier kg, high = above. Add a row for any "
+                   "new country — unlisted countries get 0 MAUT (with a warning).")
+        if 'pallet_maut_df' not in st.session_state:
+            st.session_state.pallet_maut_df = _default_pallet_maut_df()
+        _maut_edit = st.data_editor(
+            st.session_state.pallet_maut_df, num_rows="dynamic",
+            use_container_width=True, hide_index=True,
+            column_config={
+                'Country': st.column_config.TextColumn(width="small"),
+                'MAUT % (≤ tier)': st.column_config.NumberColumn(format="%.4f"),
+                'MAUT % (> tier)': st.column_config.NumberColumn(format="%.4f"),
+                'Tier kg': st.column_config.NumberColumn(format="%d"),
+            }, key='pallet_maut_editor')
+        st.session_state.pallet_maut_df = _maut_edit
+        pallet_maut_table = pallet_maut_from_editor(_maut_edit)
 
     st.divider()
     run_btn = st.button("▶ Generate matrices", type="primary",
@@ -376,7 +431,6 @@ with st.sidebar:
 
 st.markdown("## Select countries")
 
-# ── Parse warnings (shown whenever a file is loaded) ──────────────────────────
 _parse_warnings = st.session_state.get('parse_warnings', [])
 if _parse_warnings:
     with st.expander(f"⚠️ {len(_parse_warnings)} parse warning(s) — some carriers or sheets "
@@ -397,26 +451,28 @@ else:
     selectable = ALL_COUNTRIES
     st.caption("Choose which countries to generate matrices for.")
 
-# Initialise chk_ keys for any new countries (first load)
+if 'country_selection' not in st.session_state:
+    st.session_state.country_selection = {}
 for c in selectable:
-    if f'chk_{c}' not in st.session_state:
-        st.session_state[f'chk_{c}'] = False
+    st.session_state.country_selection.setdefault(c, False)
 
 ca, cb, *_ = st.columns([1, 1, 8])
 if ca.button("Select all"):
     for c in selectable:
-        st.session_state[f'chk_{c}'] = True
+        st.session_state.country_selection[c] = True
 if cb.button("Clear"):
     for c in selectable:
-        st.session_state[f'chk_{c}'] = False
+        st.session_state.country_selection[c] = False
 
 COLS = 10
 grid = st.columns(COLS)
 for i, country in enumerate(selectable):
     with grid[i % COLS]:
-        st.checkbox(country, key=f'chk_{country}')
+        st.session_state.country_selection[country] = st.checkbox(
+            country, value=st.session_state.country_selection.get(country, False),
+            key=f'chk_{country}')
 
-selected = [c for c in selectable if st.session_state.get(f'chk_{c}')]
+selected = [c for c in selectable if st.session_state.country_selection.get(c)]
 
 # ── Advanced per-country settings ─────────────────────────────────────────────
 if selected:
@@ -459,7 +515,7 @@ with st.expander("📐 Exceptions & buckets — oversize / surcharges per carrie
         "CargoWrite matches each order top-down and takes the first row that "
         "fits. A size limit means a row only matches parcels at/under that size; "
         "anything bigger must fall through to a **bucket** row that drops the "
-        "limit, flags it (AWKWARD), and adds a surcharge. Buckets are added to "
+        "limit and adds a surcharge. Buckets are added to "
         "every output and shown in amber. Leave the table empty for no buckets."
     )
     if 'exceptions_df' not in st.session_state:
@@ -473,6 +529,10 @@ with st.expander("📐 Exceptions & buckets — oversize / surcharges per carrie
                 options=['(all)'] + list(pl.CARRIER_DEFAULTS), width="small"),
             'Country (blank=all)': st.column_config.TextColumn(
                 help="ISO2 code(s), comma-separated. Blank = all countries.", width="small"),
+            'Service level (blank=all)': st.column_config.TextColumn(
+                help="e.g. STANDARD. Comma-separated. Blank = all services. "
+                     "UPDE oversize defaults to STANDARD only (excludes Express Saver).",
+                width="small"),
             'Size limit (m)': st.column_config.NumberColumn(
                 format="%.2f", help="Stamped on the normal (cheap) rows."),
             'Surcharge €/parcel': st.column_config.NumberColumn(format="%.2f"),
@@ -530,6 +590,34 @@ if run_btn and uploaded and selected:
     rules    = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
     ov_rules = overflow_rules_from_editor(st.session_state.get('overflow_df', DEFAULT_OVERFLOW))
     pc_rules = postcode_rules_from_editor(st.session_state.get('postcode_df', DEFAULT_POSTCODE))
+    pallets  = st.session_state.get('pallets')   # None if no pallet card uploaded
+
+    # Pallet surcharge config: globals (fuel/mobility/admin/factor) + UK-only toll.
+    pal_defaults = deepcopy(pl.PALLET_DEFAULTS)
+    pal_overrides = deepcopy(pl.PALLET_COUNTRY_OVERRIDES)
+    if pallet_vals:
+        pal_defaults['DHL-FENDER'].update({
+            'fuel_pct':           pallet_vals.get('fuel',     pal_defaults['DHL-FENDER']['fuel_pct']),
+            'mobility_pct':       pallet_vals.get('mobility', pal_defaults['DHL-FENDER']['mobility_pct']),
+            'factor':             pallet_vals.get('factor',   pal_defaults['DHL-FENDER']['factor']),
+            'admin_per_shipment': pallet_vals.get('admin',    pal_defaults['DHL-FENDER']['admin_per_shipment']),
+        })
+        # Toll is GB-only in the contract; apply the sidebar value to GB.
+        pal_overrides.setdefault('GB', {})
+        pal_overrides['GB']['toll_pct'] = pallet_vals.get('toll',
+                                                          pal_overrides['GB'].get('toll_pct', 0.0043))
+        pal_overrides['GB']['admin_per_shipment'] = pallet_vals.get(
+            'admin', pal_defaults['DHL-FENDER']['admin_per_shipment'])
+
+    _maut_dhl_ref = pl.CARRIER_DEFAULTS['DHL-ROS']['maut_pct']
+    _maut_dpd_ref = pl.CARRIER_DEFAULTS['DPD']['maut_pct']
+    st.session_state['variables_layout_rows'] = variables_layout(
+        fuel_vals, _maut_dhl_ref, _maut_dpd_ref, pallet_vals)
+    # Stash pallet config so the combined export can write matching formulas.
+    st.session_state['pallet_maut_table'] = pallet_maut_table
+    st.session_state['pallet_defaults_used'] = pal_defaults
+    st.session_state['carrier_defaults_used'] = carrier_defaults(
+        fuel_vals, _maut_dhl_ref, _maut_dpd_ref)
     progress = st.progress(0, text="Starting…")
 
     for idx, country in enumerate(selected):
@@ -537,37 +625,35 @@ if run_btn and uploaded and selected:
                           text=f"Processing {country}…  ({idx+1}/{len(selected)})")
         try:
             cfg = country_cfg_with_overrides(country)
+            pallet_zones = (pp.country_pallet_data(pallets, country)
+                            if pallets else None)
 
             if is_master:
                 parsed = mp.country_rate_data(master, country)
                 maut   = mp.country_maut(master, country)
                 cd = carrier_defaults(fuel_vals, maut['DHL-ROS'], maut['DPD'])
-                vl = variables_layout(fuel_vals, maut['DHL-ROS'], maut['DPD'])
-                missing = [cid for cid in cfg['carriers'] if cid not in parsed]
-                for cid in missing:
-                    errors.setdefault(country, []).append(
-                        f"⚠️ {cid}: no rate data found for {country} — carrier skipped")
-                with tempfile.TemporaryDirectory() as tmp:
-                    result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
-                                                         exceptions=rules,
-                                                         overflow_rules=ov_rules,
-                                                         postcode_rules=pc_rules)
-                    result = persist(result)
+                vl = variables_layout(fuel_vals, maut['DHL-ROS'], maut['DPD'], pallet_vals)
             else:
                 parsed = st.session_state.get('parsed_per_country', {})
                 cd = carrier_defaults(fuel_vals, maut_dhl, maut_dpd)
-                vl = variables_layout(fuel_vals, maut_dhl, maut_dpd)
-                missing = [cid for cid in cfg['carriers'] if cid not in parsed]
-                for cid in missing:
-                    errors.setdefault(country, []).append(
-                        f"⚠️ {cid}: no rate data found — carrier skipped")
-                with tempfile.TemporaryDirectory() as tmp:
-                    result = pl.run_pipeline_from_parsed(parsed, country, tmp, cfg, cd, vl,
-                                                         exceptions=rules,
-                                                         overflow_rules=ov_rules,
-                                                         postcode_rules=pc_rules)
-                    result = persist(result)
+                vl = variables_layout(fuel_vals, maut_dhl, maut_dpd, pallet_vals)
 
+            missing = [cid for cid in cfg['carriers'] if cid not in parsed]
+            for cid in missing:
+                errors.setdefault(country, []).append(
+                    f"⚠️ {cid}: no rate data found for {country} — carrier skipped")
+
+            with tempfile.TemporaryDirectory() as tmp:
+                result = pl.run_pipeline_from_parsed(
+                    parsed, country, tmp, cfg, cd, vl,
+                    exceptions=rules, overflow_rules=ov_rules, postcode_rules=pc_rules,
+                    pallet_zones=pallet_zones, pallet_defaults=pal_defaults,
+                    pallet_overrides=pal_overrides, pallet_maut=pallet_maut_table,
+                    pallet_max_band_kg=(pallet_max_band_kg or None))
+                result = persist(result)
+
+            if result.get('pallet_warning'):
+                errors.setdefault(country, []).append(result['pallet_warning'])
             st.session_state.results[country] = result
         except Exception as e:
             errors.setdefault(country, []).append(str(e))
@@ -608,8 +694,25 @@ if st.session_state.results:
                                 key=f'dl_{country}_{key}')
 
     st.markdown("#### Download everything")
-    st.download_button("📦 Download all countries as ZIP", data=make_zip(results),
-                       file_name="rate_matrices.zip", mime="application/zip", type="primary")
-    st.download_button("📊 Download combined matrix (all countries)", data=make_combined_excel(results),
-                       file_name="rate_matrix_combined.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        st.download_button("📦 Download all countries as ZIP", data=make_zip(results),
+                           file_name="rate_matrices.zip", mime="application/zip",
+                           type="primary")
+    with dc2:
+        _vl_rows = st.session_state.get('variables_layout_rows', pl.VARIABLES_LAYOUT)
+        _combined = make_combined(
+            results, _vl_rows,
+            pallet_maut=st.session_state.get('pallet_maut_table'),
+            pallet_defaults=st.session_state.get('pallet_defaults_used'),
+            carrier_defaults=st.session_state.get('carrier_defaults_used'))
+        if _combined is not None:
+            st.download_button(
+                "🧩 Download combined (all countries, one sheet)",
+                data=_combined, file_name="Combined_Matrix_minimal.xlsx",
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                help="Every selected country's minimal matrix merged into a single "
+                     "sheet, sorted by country then price. Values are written numeric "
+                     "so per-country surcharges stay correct.")
+        else:
+            st.caption("Combined export unavailable — re-run to regenerate.")

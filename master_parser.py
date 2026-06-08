@@ -146,15 +146,18 @@ def _parse_upsde_zones(ws):
             last_iso = country_val.strip().upper()
         if last_iso is None:
             continue
-        from_raw = ws.cell(r, from_col).value
-        to_raw   = ws.cell(r, to_col).value
-        # 'ALL' means country has a single zone covering all postcodes (e.g. DE, FR, NL)
-        if isinstance(from_raw, str) and from_raw.strip().upper() == 'ALL':
+        # Accept either numeric postcode ranges OR the literal token 'ALL'
+        # (meaning "the entire country"). The per-country parser in pipeline.py
+        # already maps ALL -> 0..99999; the master parser must do the same or
+        # every country whose zone row says 'ALL' (~210 countries) gets dropped.
+        pc_from_raw = ws.cell(r, from_col).value
+        pc_to_raw   = ws.cell(r, to_col).value
+        if isinstance(pc_from_raw, str) and pc_from_raw.strip().upper() == 'ALL':
             pc_from, pc_to = 0, 99999
         else:
             try:
-                pc_from = int(str(from_raw))
-                pc_to   = int(str(to_raw)) if to_raw is not None else pc_from
+                pc_from = int(str(pc_from_raw))
+                pc_to   = int(str(pc_to_raw))
             except (TypeError, ValueError):
                 continue
         entry = {'pc_from': pc_from, 'pc_to': pc_to}

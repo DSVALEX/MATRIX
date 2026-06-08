@@ -764,7 +764,8 @@ def _common(site, client, carrier, iso2):
     return {'SITE_ID': site, 'CLIENT_ID': client, 'CARRIER_ID': carrier,
             'COUNTRYISO2': iso2, 'POSTCODE': None, 'MIN_WEIGHT': None,
             'MIN_VOLUME': None, 'MIN_PARCEL': None,
-            'USER_DEF_TYPE_4 (max 1,5m)': None, 'AWKWARD': None, 'RATE_EXTRA': 0}
+            'USER_DEF_TYPE_2': None,
+            'USER_DEF_TYPE_4 (max 1,5m)': None, 'RATE_EXTRA': 0}
 
 
 def build_rows_upde(rate_data, country_cfg):
@@ -786,6 +787,7 @@ def build_rows_upde(rate_data, country_cfg):
                 if key not in seen:
                     seen.add(key)
                     rows.append({**c0, 'POSTCODE': pc, 'SERVICE_LEVEL': 'STANDARD',
+                                 'USER_DEF_TYPE_2': 'single',
                                  'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
                                  'RATE_BASE': round(rb, 4)})
 
@@ -802,6 +804,7 @@ def build_rows_upde(rate_data, country_cfg):
                 if key not in seen:
                     seen.add(key)
                     rows.append({**c0, 'POSTCODE': pc, 'SERVICE_LEVEL': 'STANDARD',
+                                 'USER_DEF_TYPE_2': 'multi',
                                  'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
                                  'RATE_BASE': round(rate, 4)})
 
@@ -1091,13 +1094,13 @@ def compute_numeric_totals(df, carrier_defaults=None):
     df['MAUT'] = df.apply(
         lambda r: cd[r['CARRIER_ID']]['maut_pct'] * r['RATE_BASE'], axis=1
     ).round(4)
-    df['Linehaul UPSDE'] = df.apply(
+    df['Linehaul UPSDE'] = pd.to_numeric(df.apply(
         lambda r: (cd[r['CARRIER_ID']]['linehaul_per_parcel'] * r['MAX_PARCEL']
                    if cd[r['CARRIER_ID']]['linehaul_per_parcel'] > 0
                    and r['MAX_PARCEL'] is not None
                    and not pd.isna(r['MAX_PARCEL']) else None),
         axis=1,
-    ).round(4)
+    ), errors='coerce').round(4)
 
     vdiv = lambda r: cd[r['CARRIER_ID']]['volume_divisor']
     df['MAX_VOLUME']  = df.apply(lambda r: r['MAX_WEIGHT'] / vdiv(r), axis=1)
@@ -1118,7 +1121,8 @@ COLUMN_ORDER = [
     'SITE_ID', 'CLIENT_ID', 'CARRIER_ID', 'SERVICE_LEVEL', 'COUNTRYISO2',
     'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
     'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
-    'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD', 'RATE_BASE', 'RATE_EXTRA',
+    'USER_DEF_TYPE_2',
+    'USER_DEF_TYPE_4 (max 1,5m)', 'RATE_BASE', 'RATE_EXTRA',
     'FUEL', 'MAUT', 'Linehaul UPSDE', 'TOTAL_PRICE',
 ]
 COL_LETTER = {name: openpyxl.utils.get_column_letter(i + 1)
@@ -1321,8 +1325,8 @@ def optimize_globally(input_path, output_path):
 #     'constraint_col': 'USER_DEF_TYPE_4 (max 1,5m)',
 #     'normal_value':   1.5,           # stamped on the cheap base rows
 #     'bucket_value':   None,          # value on the bucket twin (None = catch-all)
-#     'flag_col':       'AWKWARD',     # column flagged on the bucket twin
-#     'flag_value':     'y',
+#     'flag_col':       None,          # optional flag column; None = no flag (AWKWARD removed)
+#     'flag_value':     'y',           # only used if flag_col is set
 #     'surcharge':      6.0,           # euros
 #     'surcharge_mode': 'per_parcel',  # 'per_parcel' (× MAX_PARCEL) or 'flat'
 #   }
@@ -1372,6 +1376,8 @@ def apply_exceptions(df, rules):
             scope &= df['CARRIER_ID'].isin(rule['carriers'])
         if rule.get('countries'):
             scope &= df['COUNTRYISO2'].isin(rule['countries'])
+        if rule.get('service_levels'):
+            scope &= df['SERVICE_LEVEL'].isin(rule['service_levels'])
         if not scope.any():
             continue
 
@@ -1407,7 +1413,7 @@ def add_overflow_buckets(df, rules, carrier_defaults=None, country_cfg=None):
         EACH_WEIGHT = blank
         RATE_BASE  = overflow_rate * n       (overflow_rate is manager-supplied)
         RATE_EXTRA = surcharge * n
-        flag       = AWKWARD = 'Y'
+        flag       = optional (flag_col defaults to None — no flag column)
 
     The overflow_rate is NOT inferred from the grid (the example used a hand-set
     heavy/per-kg rate); it must be provided in the rule. Rows are flagged so ops
@@ -1429,7 +1435,7 @@ def add_overflow_buckets(df, rules, carrier_defaults=None, country_cfg=None):
         except (TypeError, ValueError, KeyError):
             log.warning('overflow rule skipped — no valid overflow_rate'); continue
         sur      = float(rule.get('surcharge', 0) or 0)
-        flag_col = rule.get('flag_col', 'AWKWARD')
+        flag_col = rule.get('flag_col')
         flag_val = rule.get('flag_value', 'Y')
 
         base = df[~df['_is_bucket']]
@@ -1465,8 +1471,10 @@ def add_overflow_buckets(df, rules, carrier_defaults=None, country_cfg=None):
                     'EACH_WEIGHT': None,   'MAX_VOLUME': None, 'EACH_VOLUME': None,
                     'RATE_BASE': rb,       'RATE_EXTRA': round(sur * n, 4),
                     'FUEL': fuel,          'MAUT': maut, 'Linehaul UPSDE': lh,
-                    flag_col: flag_val,    '_is_bucket': True,
+                    '_is_bucket': True,
                 })
+                if flag_col:
+                    row[flag_col] = flag_val
                 row['TOTAL_PRICE'] = round(rb + sur * n + fuel + maut + (lh or 0), 4)
                 new.append(row)
 
@@ -1490,7 +1498,7 @@ def add_postcode_catchall(df, rules, carrier_defaults=None):
         if not rule.get('enabled', True):
             continue
         sur      = float(rule.get('surcharge', 0) or 0)
-        flag_col = rule.get('flag_col', 'AWKWARD')
+        flag_col = rule.get('flag_col')
         flag_val = rule.get('flag_value', 'Y')
 
         base = df[(~df['_is_bucket']) & (df['POSTCODE'].notna())]
@@ -1506,7 +1514,8 @@ def add_postcode_catchall(df, rules, carrier_defaults=None):
         worst = base.loc[base.groupby(keys)['TOTAL_PRICE'].idxmax()].copy()
         worst['POSTCODE']   = None
         worst['RATE_EXTRA'] = worst['RATE_EXTRA'].fillna(0) + sur
-        worst[flag_col]     = flag_val
+        if flag_col:
+            worst[flag_col] = flag_val
         worst['_is_bucket'] = True
         new.append(worst)
 
@@ -1580,38 +1589,77 @@ def run_pipeline(input_path, country, output_dir='.',
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
                              carrier_defaults=None, variables_layout=None,
                              exceptions=None, overflow_rules=None,
-                             postcode_rules=None):
+                             postcode_rules=None,
+                             pallet_zones=None, pallet_defaults=None,
+                             pallet_overrides=None, pallet_maut=None,
+                             pallet_max_band_kg=None):
     """Build/optimize/write from an already-parsed rate dict.
     Used by the master-file path so the (expensive) parse happens only once.
 
-    If `exceptions` (a list of rule dicts) is given, each output also gets the
-    stamped limits + catch-all bucket rows (coloured), and the minimal stage
-    runs fully in pandas so buckets are added to the *surviving* rows only —
-    keeping the list as short as possible.
+    Parcel behaviour is unchanged. If `pallet_zones` is given (a
+    {zip: {band_kg: rate}} dict from pallet_parser.country_pallet_data), DHL-FENDER
+    pallet rows are built and merged into every stage. Whenever pallet rows are
+    present the matrix is written NUMERICALLY (no Variables formulas) to match the
+    reference pallet file and keep per-country surcharges exact.
+
+    Always returns a 'minimal_df' key: the path to a pickled numeric DataFrame of
+    the minimal matrix, which app.py concatenates into the combined workbook.
     """
     cd = carrier_defaults or CARRIER_DEFAULTS
     vl = variables_layout or VARIABLES_LAYOUT
     country = country.upper()
 
     df = build_extended_matrix(parsed, cfg)
-    log.info('raw rows: %d', len(df))
-    if df.empty:
-        raise ValueError(f"No rows built for {country} — no matching rate data "
-                         f"for carriers {cfg['carriers']}.")
+    log.info('raw parcel rows: %d', len(df))
+    if not df.empty:
+        df = compute_numeric_totals(df, cd)
 
-    df = compute_numeric_totals(df, cd)
+    # ── Pallet rows (optional) ───────────────────────────────────────────────
+    df_pal_ext = pd.DataFrame()
+    df_pal_opt = pd.DataFrame()
+    pallet_warn = None
+    if pallet_zones:
+        bands = sorted({int(b) for zmap in pallet_zones.values() for b in zmap})
+        # Optional weight cap: drop every band whose ceiling exceeds the cap, so
+        # pallets heavier than it simply get no DHL-FENDER row. Bands come from
+        # the rate-card headers; this trims them without touching the source file.
+        if pallet_max_band_kg:
+            cap  = int(pallet_max_band_kg)
+            kept = [b for b in bands if b <= cap]
+            if len(kept) < len(bands):
+                log.info('pallet band cap %d kg: %d → %d bands (top now %s)',
+                         cap, len(bands), len(kept),
+                         kept[-1] if kept else 'none')
+            bands = kept
+
+        if not bands:
+            pallet_warn = (f"⚠️ DHL-FENDER: pallet weight cap "
+                           f"({int(pallet_max_band_kg)} kg) is below the smallest "
+                           f"rate-card band for {country} — no pallet rows built.")
+        else:
+            df_pal_ext, maut_known = build_pallet_df(
+                country, pallet_zones, bands,
+                pallet_defaults, pallet_overrides, pallet_maut)
+            df_pal_opt = collapse_pallet_bands(df_pal_ext)
+            if not maut_known and not df_pal_ext.empty:
+                pallet_warn = (f"⚠️ DHL-FENDER: MAUT % unknown for {country} — pallet "
+                               f"MAUT set to 0. Add it in the pallet MAUT table.")
+            log.info('pallet rows: %d ext / %d collapsed', len(df_pal_ext), len(df_pal_opt))
+
+    if df.empty and df_pal_ext.empty:
+        raise ValueError(f"No rows built for {country} — no matching parcel or "
+                         f"pallet rate data.")
+
     out = Path(output_dir)
     ext_path = out / f'{country}_Matrix_extended.xlsx'
     opt_path = out / f'{country}_Matrix_optimized.xlsx'
     min_path = out / f'{country}_Matrix_minimal.xlsx'
 
-    df_opt = optimize_matrix(df)
+    df_opt = optimize_matrix(df) if not df.empty else pd.DataFrame()
+    has_pallet = not df_pal_ext.empty
 
     any_buckets = bool(exceptions or overflow_rules or postcode_rules)
-    if any_buckets:
-        # buckets added to surviving rows of each stage, written fresh (pandas flow).
-        # Order: overflow + postcode catch-alls first, then size buckets last so the
-        # size rule (which skips existing buckets) only stamps the normal grid rows.
+    if any_buckets and not df.empty:
         df_min = optimize_globally_df(df_opt)
 
         def _decorate(d):
@@ -1620,23 +1668,462 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
             d = apply_exceptions(d, exceptions)
             return d
 
-        ext_b, opt_b, min_b = _decorate(df), _decorate(df_opt), _decorate(df_min)
-        write_matrix_excel(ext_b, ext_path, cfg, cd, vl)
-        write_matrix_excel(opt_b, opt_path, cfg, cd, vl)
-        write_matrix_excel(min_b, min_path, cfg, cd, vl)
-        rows_ext, rows_opt, rows_min = len(ext_b), len(opt_b), len(min_b)
+        df_ext_final = _decorate(df)
+        df_opt_final = _decorate(df_opt)
+        df_min_final = _decorate(df_min)
+    else:
+        df_min = optimize_globally_df(df_opt) if not df_opt.empty else pd.DataFrame()
+        df_ext_final, df_opt_final, df_min_final = df, df_opt, df_min
+
+    if has_pallet:
+        # Merge pallet rows into each stage (pallet rows never dominate parcel
+        # rows and vice-versa — different shipment profiles), write with formulas.
+        ext_all = _align_columns([df_ext_final, df_pal_ext])
+        opt_all = _align_columns([df_opt_final, df_pal_opt])
+        min_all = _align_columns([df_min_final, df_pal_opt])
+        write_matrix_with_formulas(ext_all, ext_path, cfg, cd, vl, pallet_maut,
+                                   pallet_defaults)
+        write_matrix_with_formulas(opt_all, opt_path, cfg, cd, vl, pallet_maut,
+                                   pallet_defaults)
+        write_matrix_with_formulas(min_all, min_path, cfg, cd, vl, pallet_maut,
+                                   pallet_defaults)
+        rows_ext, rows_opt, rows_min = len(ext_all), len(opt_all), len(min_all)
+        minimal_frame = min_all
+    elif any_buckets:
+        write_matrix_excel(df_ext_final, ext_path, cfg, cd, vl)
+        write_matrix_excel(df_opt_final, opt_path, cfg, cd, vl)
+        write_matrix_excel(df_min_final, min_path, cfg, cd, vl)
+        rows_ext, rows_opt, rows_min = (len(df_ext_final), len(df_opt_final),
+                                        len(df_min_final))
+        minimal_frame = df_min_final
     else:
         write_matrix_excel(df, ext_path, cfg, cd, vl)
         write_matrix_excel(df_opt, opt_path, cfg, cd, vl)
-        stats = optimize_globally(opt_path, min_path)
-        rows_ext, rows_opt, rows_min = len(df), len(df_opt), stats['output_rows']
+        write_matrix_excel(df_min_final, min_path, cfg, cd, vl)
+        rows_ext, rows_opt, rows_min = (len(df), len(df_opt), len(df_min_final))
+        # Use the in-memory numeric frame for the combined export. Reloading the
+        # written file with pd.read_excel would return openpyxl FORMULA strings
+        # (e.g. MAUT = "=Variables!$B$9*…"), not numbers — those then collapse to
+        # the combined sheet's shared default MAUT (5%/6%). df_min_final already
+        # carries the correct per-country numeric MAUT.
+        minimal_frame = df_min_final
 
-    log.info('=== Done: %d ext / %d opt / %d min ===', rows_ext, rows_opt, rows_min)
+    # Persist the minimal numeric frame for the combined-workbook export.
+    min_df_path = out / f'{country}_Matrix_minimal.pkl'
+    try:
+        minimal_frame.to_pickle(min_df_path)
+        min_df_str = str(min_df_path)
+    except Exception:
+        min_df_str = None
+
+    log.info('=== Done %s: %d ext / %d opt / %d min ===',
+             country, rows_ext, rows_opt, rows_min)
     return {
-        'extended':      str(ext_path),
-        'optimized':     str(opt_path),
-        'minimal':       str(min_path),
-        'rows_extended': rows_ext,
+        'extended':       str(ext_path),
+        'optimized':      str(opt_path),
+        'minimal':        str(min_path),
+        'minimal_df':     min_df_str,
+        'rows_extended':  rows_ext,
         'rows_optimized': rows_opt,
-        'rows_minimal':  rows_min,
+        'rows_minimal':   rows_min,
+        'pallet_warning': pallet_warn,
     }
+
+
+# ==============================================================================
+# 11. PALLET / FREIGHT INTEGRATION  (carrier DHL-FENDER, service EUROCONNECT)
+# ==============================================================================
+#
+# Pallet rates come from the "DHL pricing with factor for DSV matrix" file via
+# pallet_parser.country_pallet_data() -> {zip_prefix(str): {band_ceiling_kg: rate}}.
+# These rates are already FACTORED. The cost stack on top (verified to the cent
+# against ITFRDE_final_for_Fender_Pallets.xlsx):
+#
+#   RATE_BASE = factored_rate * FACTOR_DHL
+#   FUEL      = fuel_pct      * RATE_BASE        (global)
+#   MOBILITY  = mobility_pct  * RATE_BASE        (global)
+#   MAUT      = maut_pct(country, band) * RATE_BASE   (per-country, 2-tier)
+#   TOLL      = toll_pct(country) * RATE_BASE     (GB only in this contract)
+#   ADMIN     = admin_per_shipment (€, global flat per row)
+#   TOTAL     = RATE_BASE + FUEL + MOBILITY + MAUT + TOLL + ADMIN
+#
+# Pallet rows are NUMERIC (no Variables-sheet formulas) — matching the reference
+# file and the combined export. When a matrix contains pallet rows the WHOLE
+# matrix is written numerically; pure-parcel matrices keep the formula writer.
+
+PALLET_DEFAULTS = {
+    'DHL-FENDER': {
+        'label':              'DHL Freight',
+        'service_level':      'EUROCONNECT',
+        'fuel_pct':           0.155,   # FUEL DHL PALLET
+        'mobility_pct':       0.04,    # MOBILITY PALLET
+        'admin_per_shipment': 46.51,   # ADMIN PALLET (€, applies to every row)
+        'factor':             1.0,     # FACTOR DHL (rates already factored)
+        'toll_pct':           0.0,     # default no toll; GB set in overrides
+    },
+}
+
+# Per-country surcharge overrides. Only the UK carries the road toll in this
+# contract. app.py overwrites toll_pct / admin_per_shipment here from the sidebar.
+PALLET_COUNTRY_OVERRIDES = {
+    'GB': {'toll_pct': 0.0043, 'admin_per_shipment': 46.51},
+}
+
+# Per-country MAUT as a % of RATE_BASE, with an optional 2nd tier above a weight
+# breakpoint:  (low_pct, high_pct, tier_kg)  — high_pct applies when band ceiling
+# > tier_kg. Source: DSV pallet MAUT list (S2026). Low tier is 2.53% everywhere;
+# the high tier (>2500 kg, up to FTL) is 5.44% for the road-toll countries below
+# and 2.53% (flat) for the rest. Countries absent here default to 0 MAUT and raise
+# a warning (never guessed).
+PALLET_MAUT = {iso: (0.0253, 0.0544, 2500) for iso in
+               ('AT', 'CH', 'CZ', 'DE', 'HR', 'HU', 'PL', 'SI', 'SK')}
+PALLET_MAUT.update({iso: (0.0253, 0.0253, 2500) for iso in
+                    ('BA', 'BG', 'DK', 'EE', 'FI', 'GR', 'IT', 'LT', 'LU', 'LV',
+                     'MK', 'NO', 'RO', 'RS', 'SE', 'TR')})
+# Confirmed by Fender logistics: these countries are genuinely 0% MAUT.
+# Listed explicitly so they price correctly and stop firing "MAUT unknown" warnings.
+PALLET_MAUT.update({iso: (0.0, 0.0, 2500) for iso in
+                    ('BE', 'ES', 'FR', 'GB', 'IE', 'MT', 'NL', 'PT')})
+
+# Extra columns pallet rows carry, in the reference file's order.
+PALLET_COLUMN_ORDER = [
+    'SITE_ID', 'CLIENT_ID', 'CARRIER_ID', 'SERVICE_LEVEL', 'COUNTRYISO2',
+    'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
+    'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
+    'FACTORED RATE PALLET', 'USER_DEF_TYPE_1', 'USER_DEF_TYPE_2',
+    'USER_DEF_TYPE_4 (max 1,5m)',
+    'RATE_BASE', 'RATE_EXTRA', 'MOBILITY', 'FUEL', 'MAUT', 'Linehaul UPSDE',
+    'TOLL', 'ADMIN', 'TOTAL_PRICE',
+]
+
+
+def _pallet_maut_for(country, ceiling_kg, maut_table):
+    rule = maut_table.get(country.upper())
+    if rule is None:
+        return None                       # unknown -> caller warns
+    low, high, tier = rule
+    return high if (ceiling_kg is not None and ceiling_kg > tier) else low
+
+
+def build_pallet_df(country, zip_rate_map, band_ceilings,
+                    pallet_defaults=None, pallet_overrides=None,
+                    pallet_maut=None):
+    """Return (DataFrame, maut_known) of DHL-FENDER pallet rows for one country.
+
+    zip_rate_map : {zip_prefix(str): {ceiling_kg(int): factored_rate}}
+    band_ceilings: ordered list of band ceilings (kg)
+    """
+    pd_def = (pallet_defaults or PALLET_DEFAULTS)['DHL-FENDER']
+    ov     = (pallet_overrides or PALLET_COUNTRY_OVERRIDES).get(country.upper(), {})
+    mt     = pallet_maut or PALLET_MAUT
+    iso    = country.upper()
+
+    fuel_pct  = pd_def['fuel_pct']
+    mob_pct   = pd_def['mobility_pct']
+    factor    = pd_def['factor']
+    toll_pct  = ov.get('toll_pct', pd_def.get('toll_pct', 0.0))
+    admin     = ov.get('admin_per_shipment', pd_def['admin_per_shipment'])
+    service   = pd_def['service_level']
+    maut_known = iso in mt
+
+    rows = []
+    for zkey in sorted(zip_rate_map, key=lambda z: (len(str(z)), str(z))):
+        band_map = zip_rate_map[zkey]
+        prev_ceiling = 0
+        for ceil in band_ceilings:
+            rate = band_map.get(ceil)
+            if rate is None:
+                continue
+            rate_base = round(rate * factor, 6)
+            fuel = round(fuel_pct * rate_base, 6)
+            mob  = round(mob_pct * rate_base, 6)
+            maut_pct = _pallet_maut_for(iso, ceil, mt) or 0.0
+            maut = round(maut_pct * rate_base, 8)
+            toll = round(toll_pct * rate_base, 6)
+            total = round(rate_base + fuel + mob + maut + toll + admin, 6)
+            rows.append({
+                'SITE_ID': 'NLMOE01', 'CLIENT_ID': 'NLFENDER',
+                'CARRIER_ID': 'DHL-FENDER', 'SERVICE_LEVEL': service,
+                'COUNTRYISO2': iso, 'POSTCODE': str(zkey),
+                'MIN_WEIGHT': prev_ceiling if prev_ceiling > 0 else None,
+                'MAX_WEIGHT': ceil, 'MIN_VOLUME': None, 'MAX_VOLUME': None,
+                'MIN_PARCEL': None, 'MAX_PARCEL': None,
+                'EACH_WEIGHT': None, 'EACH_VOLUME': None,
+                'FACTORED RATE PALLET': rate_base,
+                'USER_DEF_TYPE_1': None, 'USER_DEF_TYPE_2': None,
+                'USER_DEF_TYPE_4 (max 1,5m)': None,
+                'RATE_BASE': rate_base, 'RATE_EXTRA': 0,
+                'MOBILITY': mob, 'FUEL': fuel, 'MAUT': maut,
+                'Linehaul UPSDE': None, 'TOLL': toll, 'ADMIN': admin,
+                'TOTAL_PRICE': total, '_is_bucket': False,
+            })
+            prev_ceiling = ceil
+    return pd.DataFrame(rows), maut_known
+
+
+def collapse_pallet_bands(df_pallet):
+    """Within each (country, zip), drop a band whose RATE_BASE equals the band
+    directly below it — CargoWrite matches the first row with MAX_WEIGHT >= wt,
+    so the lighter identical-priced band already covers those shipments."""
+    if df_pallet.empty:
+        return df_pallet
+    df = df_pallet.sort_values(['COUNTRYISO2', 'POSTCODE', 'MAX_WEIGHT'],
+                               kind='stable').reset_index(drop=True)
+    keep, last_key, last_rate = [], None, None
+    for i, r in df.iterrows():
+        key = (r['COUNTRYISO2'], r['POSTCODE'])
+        if key == last_key and r['RATE_BASE'] == last_rate:
+            continue
+        keep.append(i)
+        last_key, last_rate = key, r['RATE_BASE']
+    return df.loc[keep].reset_index(drop=True)
+
+
+def _align_columns(frames):
+    """Concat frames giving them a common column set (union), pallet order if any
+    pallet column is present, else the parcel COLUMN_ORDER."""
+    frames = [f for f in frames if f is not None and not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    has_pallet = any('FACTORED RATE PALLET' in f.columns for f in frames)
+    order = PALLET_COLUMN_ORDER if has_pallet else COLUMN_ORDER
+    cols = list(order) + (['_is_bucket'] if any('_is_bucket' in f.columns for f in frames) else [])
+    out = []
+    for f in frames:
+        g = f.copy()
+        for c in cols:
+            if c not in g.columns:
+                g[c] = None
+        out.append(g[cols])
+    return pd.concat(out, ignore_index=True)
+
+
+def write_matrix_numeric(df, output_path, country_cfg, variables_layout=None,
+                         column_order=None):
+    """Write a matrix as NUMERIC values (no formulas). Used whenever pallet rows
+    are present, and for the combined export. Colours bucket rows amber."""
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill
+    vl    = variables_layout or VARIABLES_LAYOUT
+    order = column_order or (PALLET_COLUMN_ORDER
+                             if 'FACTORED RATE PALLET' in df.columns else COLUMN_ORDER)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{country_cfg.get('iso2', 'ALL')} Matrix"
+    for ci, col in enumerate(order, 1):
+        ws.cell(1, ci, col)
+    df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
+    fill = PatternFill('solid', fgColor='FFF2CC')
+    for ri, rec in enumerate(df_sorted.to_dict('records'), start=2):
+        is_bucket = bool(rec.get('_is_bucket'))
+        for ci, col in enumerate(order, 1):
+            v = rec.get(col)
+            cell = ws.cell(ri, ci, None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
+            if is_bucket:
+                cell.fill = fill
+    vs = wb.create_sheet('Variables')
+    for ri, (name, val) in enumerate(vl, 1):
+        vs.cell(ri, 1, name)
+        if val is not None:
+            vs.cell(ri, 2, val)
+    wb.save(output_path)
+    log.info('wrote %s (%d rows, numeric)', output_path, len(df_sorted))
+
+
+def write_combined_matrix(frames, output_path, variables_layout=None,
+                          pallet_maut=None, pallet_defaults=None,
+                          carrier_defaults=None, formulas=True):
+    """Merge every country's minimal frame into ONE sheet, sorted by country then
+    price. With formulas=True (default) the sheet uses live Variables formulas;
+    per-country pallet MAUT cells are written into the Variables sheet. `frames`
+    is a list of DataFrames (from result['minimal_df'])."""
+    combined = _align_columns(frames)
+    if combined.empty:
+        raise ValueError("write_combined_matrix: no rows to write.")
+    has_pallet = 'FACTORED RATE PALLET' in combined.columns
+    order = PALLET_COLUMN_ORDER if has_pallet else COLUMN_ORDER
+    combined = combined.sort_values(['COUNTRYISO2', 'TOTAL_PRICE'],
+                                    kind='stable').reset_index(drop=True)
+    if formulas and has_pallet:
+        write_matrix_with_formulas(combined, output_path, {'iso2': 'ALL'},
+                                   carrier_defaults, variables_layout,
+                                   pallet_maut, pallet_defaults, column_order=order)
+    else:
+        write_matrix_numeric(combined, output_path, {'iso2': 'ALL'},
+                             variables_layout, column_order=order)
+    return str(output_path)
+
+
+# ==============================================================================
+# 12. FORMULA WRITER FOR PALLET-INCLUSIVE MATRICES
+# ==============================================================================
+#
+# Pure-parcel matrices already use write_matrix_excel (formula writer, 22-col
+# layout). When pallet rows are present the layout is 28 columns, so column
+# letters shift and the parcel formula writer can't be reused as-is. This writer
+# handles BOTH row types in the 28-col layout and references the Variables sheet:
+#
+#   FUEL/MOBILITY/TOLL  = <Variables pct cell> * RATE_BASE
+#   MAUT (pallet)       = per-country, two-tier: references that country's MAUT
+#                         low/high cell depending on the row's MAX_WEIGHT vs tier
+#   MAUT/FUEL (parcel)  = the carrier's existing Variables refs (B1..B9)
+#   ADMIN               = <Variables ADMIN cell>  (flat constant)
+#   volumes             = weight / divisor   (parcel rows only)
+#   TOTAL               = sum of the components present for that row type
+#
+# Editing any Variables cell recomputes the whole sheet in Excel.
+
+def _letter_map(column_order):
+    import openpyxl.utils as _u
+    return {name: _u.get_column_letter(i + 1) for i, name in enumerate(column_order)}
+
+
+def _ensure_var(vars_rows, name, default):
+    """Return (vars_rows, row_index_1based) ensuring `name` exists in the layout."""
+    for i, (n, _v) in enumerate(vars_rows):
+        if n == name:
+            return vars_rows, i + 1
+    vars_rows = list(vars_rows) + [(name, default)]
+    return vars_rows, len(vars_rows)
+
+
+def write_matrix_with_formulas(df, output_path, country_cfg,
+                               carrier_defaults=None, variables_layout=None,
+                               pallet_maut=None, pallet_defaults=None,
+                               column_order=None):
+    """Write a pallet-inclusive matrix with live formulas referencing Variables."""
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill
+
+    cd    = carrier_defaults or CARRIER_DEFAULTS
+    pdef  = (pallet_defaults or PALLET_DEFAULTS)['DHL-FENDER']
+    mt    = pallet_maut or PALLET_MAUT
+    order = column_order or PALLET_COLUMN_ORDER
+    L     = _letter_map(order)
+
+    vars_rows = list(variables_layout or VARIABLES_LAYOUT)
+    # Ensure the pallet global cells exist and capture their Variables rows.
+    vars_rows, r_fuel  = _ensure_var(vars_rows, 'FUEL DHL PALLET', pdef['fuel_pct'])
+    vars_rows, r_mob   = _ensure_var(vars_rows, 'MOBILITY PALLET', pdef['mobility_pct'])
+    vars_rows, r_toll  = _ensure_var(vars_rows, 'TOLL UK PALLET', pdef.get('toll_pct', 0.0043))
+    vars_rows, r_admin = _ensure_var(vars_rows, 'ADMIN PALLET', pdef['admin_per_shipment'])
+
+    # Per-country pallet MAUT block: name | low(B) | high(C) | tier(D)
+    # Compute the Variables rows up-front so row formulas can reference them.
+    pallet_countries = sorted(
+        set(df.loc[df['CARRIER_ID'] == 'DHL-FENDER', 'COUNTRYISO2'].dropna())
+    ) if 'CARRIER_ID' in df.columns else []
+    maut_row = {}        # iso -> Variables row (1-based)
+    maut_header_row = None
+    if pallet_countries:
+        maut_header_row = len(vars_rows) + 2         # one spacer row after globals
+        cur = maut_header_row + 1
+        for iso in pallet_countries:
+            maut_row[iso] = cur
+            cur += 1
+
+    # write Variables sheet
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{country_cfg.get('iso2', 'ALL')} Matrix"
+    for ci, col in enumerate(order, 1):
+        ws.cell(1, ci, col)
+
+    df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
+    fill = PatternFill('solid', fgColor='FFF2CC')
+
+    L_RATE  = L['RATE_BASE']
+    L_EXTRA = L.get('RATE_EXTRA')
+    L_FUEL  = L['FUEL']
+    L_MAUT  = L['MAUT']
+    L_MOB   = L.get('MOBILITY')
+    L_TOLL  = L.get('TOLL')
+    L_ADMIN = L.get('ADMIN')
+    L_LH    = L.get('Linehaul UPSDE')
+    L_MP    = L.get('MAX_PARCEL')
+    L_EW    = L.get('EACH_WEIGHT')
+    L_MW    = L.get('MAX_WEIGHT')
+    L_MV    = L.get('MAX_VOLUME')
+    L_EV    = L.get('EACH_VOLUME')
+
+    for ri, rec in enumerate(df_sorted.to_dict('records'), start=2):
+        carrier   = rec.get('CARRIER_ID')
+        is_bucket = bool(rec.get('_is_bucket'))
+        is_pallet = (carrier == 'DHL-FENDER')
+        formulas = {}
+
+        if is_pallet:
+            iso = rec.get('COUNTRYISO2')
+            formulas['FUEL']     = f"=Variables!$B${r_fuel}*{L_RATE}{ri}"
+            formulas['MOBILITY'] = f"=Variables!$B${r_mob}*{L_RATE}{ri}"
+            # two-tier MAUT: pick low/high by this row's band vs the country tier
+            low, high, tier = mt.get(iso, (0.0, 0.0, 2500))
+            mw = rec.get('MAX_WEIGHT')
+            r_iso = maut_row.get(iso)
+            col = 'C' if (mw is not None and not pd.isna(mw) and mw > tier) else 'B'
+            formulas['MAUT'] = f"=Variables!${col}${r_iso}*{L_RATE}{ri}"
+            # TOLL: GB carries it; others 0 (still summed)
+            if L_TOLL:
+                if (rec.get('TOLL') or 0) > 0:
+                    formulas['TOLL'] = f"=Variables!$B${r_toll}*{L_RATE}{ri}"
+            if L_ADMIN:
+                formulas['ADMIN'] = f"=Variables!$B${r_admin}"
+            parts = [f"{L_RATE}{ri}"]
+            if L_EXTRA: parts.append(f"{L_EXTRA}{ri}")
+            if L_MOB:   parts.append(f"{L_MOB}{ri}")
+            parts.append(f"{L_FUEL}{ri}")
+            parts.append(f"{L_MAUT}{ri}")
+            if L_TOLL:  parts.append(f"{L_TOLL}{ri}")
+            if L_ADMIN: parts.append(f"{L_ADMIN}{ri}")
+            formulas['TOTAL_PRICE'] = "=" + "+".join(parts)
+        else:
+            cfg = cd.get(carrier, {})
+            has_grid = (rec.get('MAX_PARCEL') is not None and not pd.isna(rec.get('MAX_PARCEL'))
+                        and rec.get('EACH_WEIGHT') is not None and not pd.isna(rec.get('EACH_WEIGHT')))
+            if has_grid and L_MW and L_MP and L_EW:
+                formulas['MAX_WEIGHT'] = f"={L_MP}{ri}*{L_EW}{ri}"
+                if L_MV: formulas['MAX_VOLUME']  = f"={L_MW}{ri}/{cfg.get('volume_divisor', 1)}"
+                if L_EV: formulas['EACH_VOLUME'] = f"={L_EW}{ri}/{cfg.get('volume_divisor', 1)}"
+            if cfg.get('fuel_variables_ref'):
+                ref = cfg['fuel_variables_ref']
+                formulas['FUEL'] = f"=Variables!${ref[0]}${ref[1:]}*{L_RATE}{ri}"
+            # NB: parcel MAUT (DHL-ROS / DPD) varies PER COUNTRY, but the combined
+            # sheet has a single Variables sheet — one B8/B9 cell can't represent
+            # every country. So we keep the per-country numeric MAUT already in the
+            # frame rather than overwriting it with a single-cell formula. (FUEL is
+            # a flat global %, so its formula stays correct for every country.)
+            parts = [f"{L_RATE}{ri}"]
+            if L_EXTRA: parts.append(f"{L_EXTRA}{ri}")
+            parts.append(f"{L_FUEL}{ri}")
+            parts.append(f"{L_MAUT}{ri}")
+            if L_LH: parts.append(f"{L_LH}{ri}")
+            formulas['TOTAL_PRICE'] = "=" + "+".join(parts)
+
+        for ci, col in enumerate(order, 1):
+            if col in formulas:
+                cell = ws.cell(ri, ci, formulas[col])
+            else:
+                v = rec.get(col)
+                cell = ws.cell(ri, ci, None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
+            if is_bucket:
+                cell.fill = fill
+
+    # ── Variables sheet ──────────────────────────────────────────────────────
+    vs = wb.create_sheet('Variables')
+    for r_i, (name, val) in enumerate(vars_rows, 1):
+        vs.cell(r_i, 1, name)
+        if val is not None:
+            vs.cell(r_i, 2, val)
+    # MAUT block with low(B)/high(C)/tier(D) at the rows reserved earlier
+    if pallet_countries:
+        vs.cell(maut_header_row, 1, 'MAUT DHL PALLET — low(B) / high(C) / tier kg(D)')
+        for iso in pallet_countries:
+            low, high, tier = mt.get(iso, (0.0, 0.0, 2500))
+            r = maut_row[iso]
+            vs.cell(r, 1, f'MAUT DHL PALLET {iso}')
+            vs.cell(r, 2, low)
+            vs.cell(r, 3, high)
+            vs.cell(r, 4, tier)
+
+    wb.save(output_path)
+    log.info('wrote %s (%d rows, formulas)', output_path, len(df_sorted))
