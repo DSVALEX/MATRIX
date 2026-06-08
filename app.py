@@ -269,7 +269,15 @@ def make_combined(results, variables_layout_rows, pallet_maut=None,
     # which cannot represent per-country MAUT. Writing the already-correct
     # per-country numeric values is the only way to keep DPD/DHL MAUT right for
     # every country in a single sheet.
-    pl.write_combined_matrix(frames, out, variables_layout_rows,
+    # The single MAUT DPD / MAUT DHL cells are unused in the numeric combined
+    # (MAUT is baked per-row); blank them with a note so the Variables tab doesn't
+    # read like a flat 5%/6% is being applied.
+    vl_combined = [
+        (name, ('per country — see MAUT column' if name in ('MAUT DPD', 'MAUT DHL')
+                else val))
+        for name, val in variables_layout_rows
+    ]
+    pl.write_combined_matrix(frames, out, vl_combined,
                              pallet_maut=pallet_maut, pallet_defaults=pallet_defaults,
                              carrier_defaults=carrier_defaults, formulas=False)
     return Path(out).read_bytes()
