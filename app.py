@@ -257,27 +257,37 @@ def make_zip(results):
     return buf.read()
 
 
-def make_combined(results, variables_layout_rows, pallet_maut=None,
-                  pallet_defaults=None, carrier_defaults=None):
-    """Build ONE workbook with every country's minimal matrix in a single sheet,
-    with live formulas (per-country pallet MAUT cells written into Variables)."""
+def make_combined(results, variables_layout_rows, matrix_type='minimal',
+                  pallet_maut=None, pallet_defaults=None,
+                  carrier_defaults=None):
+
     frames = []
+
+    df_key = f'{matrix_type}_df'
+
     for country, r in results.items():
-        p = r.get('minimal_df')
+        p = r.get(df_key)
         if p and Path(p).exists():
             try:
                 frames.append(pd.read_pickle(p))
             except Exception:
                 pass
+
     if not frames:
         return None
-    out = Path(tempfile.mkdtemp()) / 'Combined_Matrix_minimal.xlsx'
-    # Numeric, not formulas: a single shared sheet can't carry per-country MAUT
-    # (DPD/DHL differ by country). Formulas would reference one Variables cell and
-    # apply the same % to every country. Numeric values keep each country correct.
-    pl.write_combined_matrix(frames, out, variables_layout_rows,
-                             pallet_maut=pallet_maut, pallet_defaults=pallet_defaults,
-                             carrier_defaults=carrier_defaults, formulas=False)
+
+    out = Path(tempfile.mkdtemp()) / f'Combined_Matrix_{matrix_type}.xlsx'
+
+    pl.write_combined_matrix(
+        frames,
+        out,
+        variables_layout_rows,
+        pallet_maut=pallet_maut,
+        pallet_defaults=pallet_defaults,
+        carrier_defaults=carrier_defaults,
+        formulas=False
+    )
+
     return Path(out).read_bytes()
 
 
@@ -697,20 +707,71 @@ if st.session_state.results:
         st.download_button("📦 Download all countries as ZIP", data=make_zip(results),
                            file_name="rate_matrices.zip", mime="application/zip",
                            type="primary")
-    with dc2:
-        _vl_rows = st.session_state.get('variables_layout_rows', pl.VARIABLES_LAYOUT)
-        _combined = make_combined(
-            results, _vl_rows,
-            pallet_maut=st.session_state.get('pallet_maut_table'),
-            pallet_defaults=st.session_state.get('pallet_defaults_used'),
-            carrier_defaults=st.session_state.get('carrier_defaults_used'))
-        if _combined is not None:
-            st.download_button(
-                "🧩 Download combined (all countries, one sheet)",
-                data=_combined, file_name="Combined_Matrix_minimal.xlsx",
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                help="Every selected country's minimal matrix merged into a single "
-                     "sheet, sorted by country then price. Values are written numeric "
-                     "so per-country surcharges stay correct.")
+    dc1, dc2, dc3, dc4 = st.columns(4)
+
+with dc1:
+    st.download_button(
+        "📦 Download all countries as ZIP",
+        data=make_zip(results),
+        file_name="rate_matrices.zip",
+        mime="application/zip",
+        type="primary"
+    )
+
+_vl_rows = st.session_state.get(
+    'variables_layout_rows',
+    pl.VARIABLES_LAYOUT
+)
+
+common_kwargs = dict(
+    pallet_maut=st.session_state.get('pallet_maut_table'),
+    pallet_defaults=st.session_state.get('pallet_defaults_used'),
+    carrier_defaults=st.session_state.get('carrier_defaults_used')
+)
+
+with dc2:
+    combined_minimal = make_combined(
+        results, _vl_rows,
+        matrix_type='minimal',
+        **common_kwargs
+    )
+
+    if combined_minimal is not None:
+        st.download_button(
+            "🧩 Combined Minimal",
+            combined_minimal,
+            "Combined_Matrix_minimal.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+with dc3:
+    combined_extended = make_combined(
+        results, _vl_rows,
+        matrix_type='extended',
+        **common_kwargs
+    )
+
+    if combined_extended is not None:
+        st.download_button(
+            "📋 Combined Extended",
+            combined_extended,
+            "Combined_Matrix_extended.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+with dc4:
+    combined_optimized = make_combined(
+        results, _vl_rows,
+        matrix_type='optimized',
+        **common_kwargs
+    )
+
+    if combined_optimized is not None:
+        st.download_button(
+            "⚡ Combined Optimized",
+            combined_optimized,
+            "Combined_Matrix_optimized.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
         else:
             st.caption("Combined export unavailable — re-run to regenerate.")
