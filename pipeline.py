@@ -1559,7 +1559,8 @@ def optimize_globally_df(df):
 
 def run_pipeline(input_path, country, output_dir='.',
                  country_cfg=None, carrier_defaults=None, variables_layout=None,
-                 exceptions=None, overflow_rules=None, postcode_rules=None):
+                 exceptions=None, overflow_rules=None, postcode_rules=None,
+                 pallet_max_band_kg=None):
     """
     Full pipeline for one country.
 
@@ -1587,7 +1588,8 @@ def run_pipeline(input_path, country, output_dir='.',
     log.info('=== Pipeline for %s ===', country)
     parsed = parse_rate_cards(input_path)
     return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl,
-                                    exceptions, overflow_rules, postcode_rules)
+                                    exceptions, overflow_rules, postcode_rules,
+                                    pallet_max_band_kg=pallet_max_band_kg)
 
 
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
@@ -1595,7 +1597,8 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
                              exceptions=None, overflow_rules=None,
                              postcode_rules=None,
                              pallet_zones=None, pallet_defaults=None,
-                             pallet_overrides=None, pallet_maut=None):
+                             pallet_overrides=None, pallet_maut=None,
+                             pallet_max_band_kg=None):
     """Build/optimize/write from an already-parsed rate dict.
     Used by the master-file path so the (expensive) parse happens only once.
 
@@ -1627,6 +1630,8 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
             bands = sorted({int(b) for zmap in pallet_zones.values() for b in zmap})
         except Exception:
             bands = sorted({int(b) for zmap in pallet_zones.values() for b in zmap})
+        if pallet_max_band_kg:                       # configurable max pallet weight
+            bands = [b for b in bands if b <= pallet_max_band_kg]
         df_pal_ext, maut_known = build_pallet_df(
             country, pallet_zones, bands,
             pallet_defaults, pallet_overrides, pallet_maut)
