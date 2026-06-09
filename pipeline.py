@@ -117,7 +117,7 @@ def _default_country_cfg(iso2):
         'iso2':                  iso2,
         'site_id':               'NLMOE01',
         'client_id':             'NLFENDER',
-        'max_parcel_count':      10,
+        'max_parcel_count':      15,
         'max_each_weight_kg':    31.5,
         'each_weight_grid':      sorted(set(list(range(1, 32)) + [31.5])),
         'carriers':              _SCANDI_CARRIERS if iso2 in _SCANDI_ISO else _BASE_CARRIERS,
@@ -769,7 +769,8 @@ def _common(site, client, carrier, iso2):
 
 
 def build_combined_weight_rows(c0, bands, max_parcel, service_level,
-                               max_ew=None, postcode=None, user_def_type_2=None):
+                               max_ew=None, postcode=None, user_def_type_2=None,
+                               min_parcel=1):
     """Combined-weight pricing: the band rate is the freight for the WHOLE
     shipment, looked up ONCE on the total payweight — never rate * parcel_count.
 
@@ -796,7 +797,7 @@ def build_combined_weight_rows(c0, bands, max_parcel, service_level,
     for band_top, rate, per_kg in bands:
         if per_kg:                       # skip the open-ended "over X / kg" tail
             continue
-        for mp in range(1, max_parcel + 1):
+        for mp in range(min_parcel, max_parcel + 1):
             each = band_top / mp
             if max_ew is not None and each > max_ew + 1e-9:
                 continue                 # band unreachable with this few parcels
@@ -818,39 +819,22 @@ def build_rows_upde(rate_data, country_cfg):
     max_ew = country_cfg['max_each_weight_kg']
     c0     = _common(country_cfg['site_id'], country_cfg['client_id'],
                      'UPDE', country_cfg['iso2'])
-    seen_by_pc = {}
 
+    # STANDARD — combined weight. A single parcel (mp=1) is priced on the STDS
+    # table (lookup on the parcel's own weight, which IS the combined weight);
+    # multi-parcel shipments (mp>=2) on the STDM total-weight table. Both do ONE
+    # rate lookup on the band ceiling, never rate * parcel_count.
     for pc, tiers in _upde_service_buckets(rate_data, 'STDS', country_cfg):
-        seen = seen_by_pc.setdefault(pc, set())
-        for each_w, rate, per_kg in collapse_same_rate_tiers(tiers, max_ew):
-            if each_w > max_ew or per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                rb  = rate * mp
-                key = (mp, each_w, rb)
-                if key not in seen:
-                    seen.add(key)
-                    rows.append({**c0, 'POSTCODE': pc, 'SERVICE_LEVEL': 'STANDARD',
-                                 'USER_DEF_TYPE_2': 'single',
-                                 'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                                 'RATE_BASE': round(rb, 4)})
+        bands = collapse_same_rate_tiers(tiers)
+        rows += build_combined_weight_rows(
+            c0, bands, max_parcel=1, service_level='STANDARD',
+            max_ew=max_ew, postcode=pc, user_def_type_2='single')
 
     for pc, tiers in _upde_service_buckets(rate_data, 'STDM', country_cfg):
-        seen = seen_by_pc.setdefault(pc, set())
-        for combined_w, rate, per_kg in collapse_same_rate_tiers(tiers):
-            if per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                each_w = combined_w / mp
-                if each_w not in country_cfg['each_weight_grid'] or each_w > max_ew:
-                    continue
-                key = (mp, each_w, rate)
-                if key not in seen:
-                    seen.add(key)
-                    rows.append({**c0, 'POSTCODE': pc, 'SERVICE_LEVEL': 'STANDARD',
-                                 'USER_DEF_TYPE_2': 'multi',
-                                 'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                                 'RATE_BASE': round(rate, 4)})
+        bands = collapse_same_rate_tiers(tiers)
+        rows += build_combined_weight_rows(
+            c0, bands, max_p, service_level='STANDARD',
+            max_ew=max_ew, postcode=pc, user_def_type_2='multi', min_parcel=2)
 
     flat = rate_data.get('EXPSAVER_7R9W62')
     if flat is not None:
@@ -1017,38 +1001,18 @@ def build_rows_upsgb(rate_data, country_cfg):
     max_ew = country_cfg['max_each_weight_kg']
     c0     = _common(country_cfg['site_id'], country_cfg['client_id'],
                      'UPSGB', country_cfg['iso2'])
-    seen = set()
 
-    # STDS — per-parcel pricing
-    for each_w, rate, per_kg in collapse_same_rate_tiers(
-            rate_data.get('STDS', []), max_ew):
-        if each_w > max_ew or per_kg:
-            continue
-        for mp in range(1, max_p + 1):
-            rb  = rate * mp
-            key = (mp, each_w, round(rb, 4))
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({**c0, 'SERVICE_LEVEL': 'STANDARD',
-                         'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                         'RATE_BASE': round(rb, 4)})
+    # STANDARD — combined weight: mp=1 priced on STDS (single), mp>=2 on STDM
+    # (multi, total-weight). One rate lookup per band, never rate * parcel_count.
+    bands_stds = collapse_same_rate_tiers(rate_data.get('STDS', []))
+    rows += build_combined_weight_rows(
+        c0, bands_stds, max_parcel=1, service_level='STANDARD',
+        max_ew=max_ew, user_def_type_2='single')
 
-    # STDM — combined-weight pricing
-    for combined_w, rate, per_kg in collapse_same_rate_tiers(rate_data.get('STDM', [])):
-        if per_kg:
-            continue
-        for mp in range(1, max_p + 1):
-            each_w = combined_w / mp
-            if each_w not in country_cfg['each_weight_grid'] or each_w > max_ew:
-                continue
-            key = (mp, each_w, round(rate, 4))
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({**c0, 'SERVICE_LEVEL': 'STANDARD',
-                         'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                         'RATE_BASE': round(rate, 4)})
+    bands_stdm = collapse_same_rate_tiers(rate_data.get('STDM', []))
+    rows += build_combined_weight_rows(
+        c0, bands_stdm, max_p, service_level='STANDARD',
+        max_ew=max_ew, user_def_type_2='multi', min_parcel=2)
 
     # EXPS — express saver: billed on TOTAL shipment payweight (one lookup).
     bands = collapse_same_rate_tiers(rate_data.get('EXPS', []))
