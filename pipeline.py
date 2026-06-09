@@ -769,11 +769,11 @@ def _common(site, client, carrier, iso2):
 
 
 def build_combined_weight_rows(c0, bands, max_parcel, service_level,
-                               postcode=None, user_def_type_2=None):
+                               max_ew=None, postcode=None, user_def_type_2=None):
     """Combined-weight pricing: the band rate is the freight for the WHOLE
     shipment, looked up ONCE on the total payweight — never rate * parcel_count.
 
-    Carriers/services billed on consolidated weight (DHL standard, UPS DE/NL
+    Carriers/services billed on consolidated weight (DHL standard, UPS DE/NL/GB
     EXPRESS SAVER, UPS DE STDM) must use this instead of the per-parcel
     `rate * mp` model, which overprices multi-parcel shipments.
 
@@ -783,17 +783,26 @@ def build_combined_weight_rows(c0, bands, max_parcel, service_level,
     EACH_WEIGHT is only a per-box cap chosen so that
     MAX_PARCEL * EACH_WEIGHT == the band's total-weight ceiling, keeping the
     existing writer/compute (MAX_WEIGHT = MAX_PARCEL * EACH_WEIGHT,
-    MAX_VOLUME = MAX_WEIGHT / divisor) consistent. It is NOT snapped to the
-    integer each-weight grid, so no band/parcel combination is dropped.
+    MAX_VOLUME = MAX_WEIGHT / divisor) consistent.
+
+    `max_ew` caps the per-box weight to the carrier's physical single-parcel
+    maximum: a band ceiling is only reachable with enough parcels
+    (band_top / mp <= max_ew). This prevents nonsensical rows like one parcel of
+    250 kg and keeps the matrix from exploding, while still covering heavy
+    multi-parcel shipments. EACH_WEIGHT is NOT snapped to the integer grid, so
+    no reachable band/parcel combination is dropped.
     """
     rows = []
     for band_top, rate, per_kg in bands:
         if per_kg:                       # skip the open-ended "over X / kg" tail
             continue
         for mp in range(1, max_parcel + 1):
+            each = band_top / mp
+            if max_ew is not None and each > max_ew + 1e-9:
+                continue                 # band unreachable with this few parcels
             row = {**c0, 'SERVICE_LEVEL': service_level,
                    'MAX_PARCEL': mp,
-                   'EACH_WEIGHT': round(band_top / mp, 6),   # cap; mp*each = band_top
+                   'EACH_WEIGHT': round(each, 6),            # cap; mp*each = band_top
                    'RATE_BASE': round(rate, 4)}              # ONE lookup, no * mp
             if postcode is not None:
                 row['POSTCODE'] = postcode
@@ -855,7 +864,7 @@ def build_rows_upde(rate_data, country_cfg):
         # not per parcel — use the full total-payweight bands (no max_ew cap).
         bands = collapse_same_rate_tiers(tiers)
         rows += build_combined_weight_rows(c0, bands, max_p, 'EXPRESS SAVER',
-                                           postcode=pc)
+                                           max_ew=max_ew, postcode=pc)
 
     # ---- WorldEase (WEA): flat per-country rate (CH, NO) ----
     wea = rate_data.get('WEA')
@@ -891,7 +900,7 @@ def build_rows_dhl(rate_data, country_cfg):
     # DHL "Other countries" is a TOTAL-payweight table (one lookup per shipment),
     # not a per-parcel table — use the full bands (no max_ew cap) and price once.
     bands = collapse_same_rate_tiers(rate_data.get('STANDARD', []))
-    rows += build_combined_weight_rows(c0, bands, max_p, 'STANDARD')
+    rows += build_combined_weight_rows(c0, bands, max_p, 'STANDARD', max_ew=max_ew)
     return rows
 
 
@@ -917,6 +926,7 @@ def build_rows_upsnl(rate_data, country_cfg):
     # so every zone uses combined-weight rows (no per-parcel * mp, no max_ew cap).
     rows   = []
     max_p  = country_cfg['max_parcel_count']
+    max_ew = country_cfg['max_each_weight_kg']
     pc_min, pc_max = country_cfg['postcode_prefix_range']
     c0     = _common(country_cfg['site_id'], country_cfg['client_id'],
                      'UPSNL', country_cfg['iso2'])
@@ -927,7 +937,8 @@ def build_rows_upsnl(rate_data, country_cfg):
 
     def emit(zone, pc):
         return build_combined_weight_rows(
-            c0, bands_by_zone.get(zone, []), max_p, 'EXPRESS SAVER', postcode=pc)
+            c0, bands_by_zone.get(zone, []), max_p, 'EXPRESS SAVER',
+            max_ew=max_ew, postcode=pc)
 
     # No zone table at all → no postcode, use first available zone
     if not zones:
@@ -1041,7 +1052,7 @@ def build_rows_upsgb(rate_data, country_cfg):
 
     # EXPS — express saver: billed on TOTAL shipment payweight (one lookup).
     bands = collapse_same_rate_tiers(rate_data.get('EXPS', []))
-    rows += build_combined_weight_rows(c0, bands, max_p, 'EXPRESS SAVER')
+    rows += build_combined_weight_rows(c0, bands, max_p, 'EXPRESS SAVER', max_ew=max_ew)
     return rows
 
 
