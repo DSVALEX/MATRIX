@@ -702,21 +702,8 @@ if st.session_state.results:
                                 key=f'dl_{country}_{key}')
 
     st.markdown("#### Download everything")
-    dc1, dc2 = st.columns(2)
-    with dc1:
-        st.download_button("📦 Download all countries as ZIP", data=make_zip(results),
-                           file_name="rate_matrices.zip", mime="application/zip",
-                           type="primary")
-    dc1, dc2, dc3, dc4 = st.columns(4)
 
-with dc1:
-    st.download_button(
-        "📦 Download all countries as ZIP",
-        data=make_zip(results),
-        file_name="rate_matrices.zip",
-        mime="application/zip",
-        type="primary"
-    )
+dc1, dc2, dc3, dc4 = st.columns(4)
 
 _vl_rows = st.session_state.get(
     'variables_layout_rows',
@@ -729,9 +716,19 @@ common_kwargs = dict(
     carrier_defaults=st.session_state.get('carrier_defaults_used')
 )
 
+with dc1:
+    st.download_button(
+        "📦 Download all countries as ZIP",
+        data=make_zip(results),
+        file_name="rate_matrices.zip",
+        mime="application/zip",
+        type="primary"
+    )
+
 with dc2:
     combined_minimal = make_combined(
-        results, _vl_rows,
+        results,
+        _vl_rows,
         matrix_type='minimal',
         **common_kwargs
     )
@@ -739,14 +736,15 @@ with dc2:
     if combined_minimal is not None:
         st.download_button(
             "🧩 Combined Minimal",
-            combined_minimal,
-            "Combined_Matrix_minimal.xlsx",
+            data=combined_minimal,
+            file_name="Combined_Matrix_minimal.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
 with dc3:
     combined_extended = make_combined(
-        results, _vl_rows,
+        results,
+        _vl_rows,
         matrix_type='extended',
         **common_kwargs
     )
@@ -754,14 +752,15 @@ with dc3:
     if combined_extended is not None:
         st.download_button(
             "📋 Combined Extended",
-            combined_extended,
-            "Combined_Matrix_extended.xlsx",
+            data=combined_extended,
+            file_name="Combined_Matrix_extended.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
 with dc4:
     combined_optimized = make_combined(
-        results, _vl_rows,
+        results,
+        _vl_rows,
         matrix_type='optimized',
         **common_kwargs
     )
@@ -769,8 +768,8 @@ with dc4:
     if combined_optimized is not None:
         st.download_button(
             "⚡ Combined Optimized",
-            combined_optimized,
-            "Combined_Matrix_optimized.xlsx",
+            data=combined_optimized,
+            file_name="Combined_Matrix_optimized.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
         else:
