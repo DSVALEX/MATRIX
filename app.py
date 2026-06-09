@@ -156,6 +156,8 @@ def exception_rules_from_editor(edited_df):
             'constraint_col': 'USER_DEF_TYPE_4 (max 1,5m)',
             'normal_value':   limit,
             'bucket_value':   None,
+            'flag_col':       'AWKWARD',
+            'flag_value':     'y',
             'surcharge':      sur,
             'surcharge_mode': 'per_parcel',
         })
@@ -192,6 +194,7 @@ def overflow_rules_from_editor(edited_df):
             'countries': [c.strip() for c in country.split(',') if c.strip()],
             'overflow_rate': rate,
             'surcharge': float(row.get('Surcharge €/parcel') or 0),
+            'flag_col': 'AWKWARD', 'flag_value': 'Y',
         })
     return rules
 
@@ -208,6 +211,7 @@ def postcode_rules_from_editor(edited_df):
             'carriers': [carrier] if carrier and carrier != '(all)' else [],
             'countries': [c.strip() for c in country.split(',') if c.strip()],
             'surcharge': float(row.get('Surcharge €') or 0),
+            'flag_col': 'AWKWARD', 'flag_value': 'Y',
         })
     return rules
 
@@ -265,21 +269,9 @@ def make_combined(results, variables_layout_rows, pallet_maut=None,
     if not frames:
         return None
     out = Path(tempfile.mkdtemp()) / 'Combined_Matrix_minimal.xlsx'
-    # Numeric (formulas=False): the combined sheet has ONE shared Variables sheet,
-    # which cannot represent per-country MAUT. Writing the already-correct
-    # per-country numeric values is the only way to keep DPD/DHL MAUT right for
-    # every country in a single sheet.
-    # The single MAUT DPD / MAUT DHL cells are unused in the numeric combined
-    # (MAUT is baked per-row); blank them with a note so the Variables tab doesn't
-    # read like a flat 5%/6% is being applied.
-    vl_combined = [
-        (name, ('per country — see MAUT column' if name in ('MAUT DPD', 'MAUT DHL')
-                else val))
-        for name, val in variables_layout_rows
-    ]
-    pl.write_combined_matrix(frames, out, vl_combined,
+    pl.write_combined_matrix(frames, out, variables_layout_rows,
                              pallet_maut=pallet_maut, pallet_defaults=pallet_defaults,
-                             carrier_defaults=carrier_defaults, formulas=False)
+                             carrier_defaults=carrier_defaults, formulas=True)
     return Path(out).read_bytes()
 
 
@@ -371,7 +363,6 @@ with st.sidebar:
     # Pallet surcharge inputs — only shown when a pallet card is loaded
     pallet_vals = {}
     pallet_maut_table = dict(pl.PALLET_MAUT)
-    pallet_max_band_kg = 0          # 0 = no cap; set by the control below
     if st.session_state.get('pallets'):
         st.markdown('<p class="section-title">Pallet surcharges (DHL-FENDER)</p>',
                     unsafe_allow_html=True)
@@ -394,13 +385,6 @@ with st.sidebar:
         pallet_vals['factor'] = st.number_input(
             'Factor (× pallet rate)', min_value=0.0001,
             value=float(_pd['factor']), step=0.01, format="%.4f", key='pal_factor')
-        pallet_max_band_kg = st.number_input(
-            'Max pallet weight (kg)  —  0 = no cap', min_value=0,
-            value=0, step=500, key='pal_max_band',
-            help="Drops every rate-card weight band whose ceiling is above this. "
-                 "Bands step 3500 → 4000 → 4500 …, so e.g. 4025 keeps bands up to "
-                 "4000 kg (the 4000,1–4500 band is dropped); 4500 keeps that band. "
-                 "0 keeps all bands (currently up to 23000 kg).")
 
         st.markdown('<p class="section-title">Pallet MAUT (% of rate)</p>',
                     unsafe_allow_html=True)
@@ -515,7 +499,7 @@ with st.expander("📐 Exceptions & buckets — oversize / surcharges per carrie
         "CargoWrite matches each order top-down and takes the first row that "
         "fits. A size limit means a row only matches parcels at/under that size; "
         "anything bigger must fall through to a **bucket** row that drops the "
-        "limit and adds a surcharge. Buckets are added to "
+        "limit, flags it (AWKWARD), and adds a surcharge. Buckets are added to "
         "every output and shown in amber. Leave the table empty for no buckets."
     )
     if 'exceptions_df' not in st.session_state:
@@ -648,8 +632,7 @@ if run_btn and uploaded and selected:
                     parsed, country, tmp, cfg, cd, vl,
                     exceptions=rules, overflow_rules=ov_rules, postcode_rules=pc_rules,
                     pallet_zones=pallet_zones, pallet_defaults=pal_defaults,
-                    pallet_overrides=pal_overrides, pallet_maut=pallet_maut_table,
-                    pallet_max_band_kg=(pallet_max_band_kg or None))
+                    pallet_overrides=pal_overrides, pallet_maut=pallet_maut_table)
                 result = persist(result)
 
             if result.get('pallet_warning'):
