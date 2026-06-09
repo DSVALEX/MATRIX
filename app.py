@@ -700,21 +700,9 @@ if st.session_state.results:
                                 file_name=Path(r[key]).name,
                                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                                 key=f'dl_{country}_{key}')
-
-    st.markdown("#### Download everything")
+st.markdown("#### Download everything")
 
 dc1, dc2, dc3, dc4 = st.columns(4)
-
-_vl_rows = st.session_state.get(
-    'variables_layout_rows',
-    pl.VARIABLES_LAYOUT
-)
-
-common_kwargs = dict(
-    pallet_maut=st.session_state.get('pallet_maut_table'),
-    pallet_defaults=st.session_state.get('pallet_defaults_used'),
-    carrier_defaults=st.session_state.get('carrier_defaults_used')
-)
 
 with dc1:
     st.download_button(
@@ -725,52 +713,62 @@ with dc1:
         type="primary"
     )
 
+_vl_rows = st.session_state.get(
+    'variables_layout_rows',
+    pl.VARIABLES_LAYOUT
+)
+
 with dc2:
-    combined_minimal = make_combined(
+    _combined = make_combined(
         results,
         _vl_rows,
         matrix_type='minimal',
-        **common_kwargs
+        pallet_maut=st.session_state.get('pallet_maut_table'),
+        pallet_defaults=st.session_state.get('pallet_defaults_used'),
+        carrier_defaults=st.session_state.get('carrier_defaults_used')
     )
 
-    if combined_minimal is not None:
+    if _combined is not None:
         st.download_button(
             "🧩 Combined Minimal",
-            data=combined_minimal,
+            data=_combined,
             file_name="Combined_Matrix_minimal.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
 with dc3:
-    combined_extended = make_combined(
+    _combined_ext = make_combined(
         results,
         _vl_rows,
         matrix_type='extended',
-        **common_kwargs
+        pallet_maut=st.session_state.get('pallet_maut_table'),
+        pallet_defaults=st.session_state.get('pallet_defaults_used'),
+        carrier_defaults=st.session_state.get('carrier_defaults_used')
     )
 
-    if combined_extended is not None:
+    if _combined_ext is not None:
         st.download_button(
             "📋 Combined Extended",
-            data=combined_extended,
+            data=_combined_ext,
             file_name="Combined_Matrix_extended.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
 with dc4:
-    combined_optimized = make_combined(
+    _combined_opt = make_combined(
         results,
         _vl_rows,
         matrix_type='optimized',
-        **common_kwargs
+        pallet_maut=st.session_state.get('pallet_maut_table'),
+        pallet_defaults=st.session_state.get('pallet_defaults_used'),
+        carrier_defaults=st.session_state.get('carrier_defaults_used')
     )
 
-    if combined_optimized is not None:
+    if _combined_opt is not None:
         st.download_button(
             "⚡ Combined Optimized",
-            data=combined_optimized,
+            data=_combined_opt,
             file_name="Combined_Matrix_optimized.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        else:
-            st.caption("Combined export unavailable — re-run to regenerate.")
+    
