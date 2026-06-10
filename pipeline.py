@@ -117,7 +117,7 @@ def _default_country_cfg(iso2):
         'iso2':                  iso2,
         'site_id':               'NLMOE01',
         'client_id':             'NLFENDER',
-        'max_parcel_count':      10,
+        'max_parcel_count':      15,
         'max_each_weight_kg':    31.5,
         'each_weight_grid':      sorted(set(list(range(1, 32)) + [31.5])),
         'carriers':              _SCANDI_CARRIERS if iso2 in _SCANDI_ISO else _BASE_CARRIERS,
@@ -131,7 +131,7 @@ COUNTRY_CONFIG = {iso: _default_country_cfg(iso) for iso in [
     'AT', 'CH', 'PL', 'CZ', 'SK', 'HU', 'SI',
     'SE', 'DK', 'NO', 'FI',
     'GR', 'HR', 'BG', 'RO', 'SM',
-    'EE', 'LV', 'LT',
+    'EE', 'LV', 'LT', 'LI'
 ]}
 # DE only has three carriers (no UPSNL)
 COUNTRY_CONFIG['DE']['carriers'] = ['UPDE', 'DPD', 'DHL-ROS']
@@ -765,7 +765,52 @@ def _common(site, client, carrier, iso2):
             'COUNTRYISO2': iso2, 'POSTCODE': None, 'MIN_WEIGHT': None,
             'MIN_VOLUME': None, 'MIN_PARCEL': None,
             'USER_DEF_TYPE_2': None,
-            'USER_DEF_TYPE_4 (max 1,5m)': None, 'RATE_EXTRA': 0}
+            'USER_DEF_TYPE_4 (max 1,5m)': None, 'AWKWARD': None, 'RATE_EXTRA': 0}
+
+
+def build_combined_weight_rows(c0, bands, max_parcel, service_level,
+                               max_ew=None, postcode=None, user_def_type_2=None,
+                               min_parcel=1):
+    """Combined-weight pricing: the band rate is the freight for the WHOLE
+    shipment, looked up ONCE on the total payweight — never rate * parcel_count.
+
+    Carriers/services billed on consolidated weight (DHL standard, UPS DE/NL/GB
+    EXPRESS SAVER, UPS DE STDM) must use this instead of the per-parcel
+    `rate * mp` model, which overprices multi-parcel shipments.
+
+    `bands` is the output of collapse_same_rate_tiers(tiers) WITHOUT a weight
+    cap, i.e. total-payweight bands as (band_top, rate, per_kg) tuples.
+
+    EACH_WEIGHT is only a per-box cap chosen so that
+    MAX_PARCEL * EACH_WEIGHT == the band's total-weight ceiling, keeping the
+    existing writer/compute (MAX_WEIGHT = MAX_PARCEL * EACH_WEIGHT,
+    MAX_VOLUME = MAX_WEIGHT / divisor) consistent.
+
+    `max_ew` caps the per-box weight to the carrier's physical single-parcel
+    maximum: a band ceiling is only reachable with enough parcels
+    (band_top / mp <= max_ew). This prevents nonsensical rows like one parcel of
+    250 kg and keeps the matrix from exploding, while still covering heavy
+    multi-parcel shipments. EACH_WEIGHT is NOT snapped to the integer grid, so
+    no reachable band/parcel combination is dropped.
+    """
+    rows = []
+    for band_top, rate, per_kg in bands:
+        if per_kg:                       # skip the open-ended "over X / kg" tail
+            continue
+        for mp in range(min_parcel, max_parcel + 1):
+            each = band_top / mp
+            if max_ew is not None and each > max_ew + 1e-9:
+                continue                 # band unreachable with this few parcels
+            row = {**c0, 'SERVICE_LEVEL': service_level,
+                   'MAX_PARCEL': mp,
+                   'EACH_WEIGHT': round(each, 6),            # cap; mp*each = band_top
+                   'RATE_BASE': round(rate, 4)}              # ONE lookup, no * mp
+            if postcode is not None:
+                row['POSTCODE'] = postcode
+            if user_def_type_2 is not None:
+                row['USER_DEF_TYPE_2'] = user_def_type_2
+            rows.append(row)
+    return rows
 
 
 def build_rows_upde(rate_data, country_cfg):
@@ -774,39 +819,22 @@ def build_rows_upde(rate_data, country_cfg):
     max_ew = country_cfg['max_each_weight_kg']
     c0     = _common(country_cfg['site_id'], country_cfg['client_id'],
                      'UPDE', country_cfg['iso2'])
-    seen_by_pc = {}
 
+    # STANDARD — combined weight. A single parcel (mp=1) is priced on the STDS
+    # table (lookup on the parcel's own weight, which IS the combined weight);
+    # multi-parcel shipments (mp>=2) on the STDM total-weight table. Both do ONE
+    # rate lookup on the band ceiling, never rate * parcel_count.
     for pc, tiers in _upde_service_buckets(rate_data, 'STDS', country_cfg):
-        seen = seen_by_pc.setdefault(pc, set())
-        for each_w, rate, per_kg in collapse_same_rate_tiers(tiers, max_ew):
-            if each_w > max_ew or per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                rb  = rate * mp
-                key = (mp, each_w, rb)
-                if key not in seen:
-                    seen.add(key)
-                    rows.append({**c0, 'POSTCODE': pc, 'SERVICE_LEVEL': 'STANDARD',
-                                 'USER_DEF_TYPE_2': 'single',
-                                 'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                                 'RATE_BASE': round(rb, 4)})
+        bands = collapse_same_rate_tiers(tiers)
+        rows += build_combined_weight_rows(
+            c0, bands, max_parcel=1, service_level='STANDARD',
+            max_ew=max_ew, postcode=pc, user_def_type_2='single')
 
     for pc, tiers in _upde_service_buckets(rate_data, 'STDM', country_cfg):
-        seen = seen_by_pc.setdefault(pc, set())
-        for combined_w, rate, per_kg in collapse_same_rate_tiers(tiers):
-            if per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                each_w = combined_w / mp
-                if each_w not in country_cfg['each_weight_grid'] or each_w > max_ew:
-                    continue
-                key = (mp, each_w, rate)
-                if key not in seen:
-                    seen.add(key)
-                    rows.append({**c0, 'POSTCODE': pc, 'SERVICE_LEVEL': 'STANDARD',
-                                 'USER_DEF_TYPE_2': 'multi',
-                                 'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                                 'RATE_BASE': round(rate, 4)})
+        bands = collapse_same_rate_tiers(tiers)
+        rows += build_combined_weight_rows(
+            c0, bands, max_p, service_level='STANDARD',
+            max_ew=max_ew, postcode=pc, user_def_type_2='multi', min_parcel=2)
 
     flat = rate_data.get('EXPSAVER_7R9W62')
     if flat is not None:
@@ -816,13 +844,11 @@ def build_rows_upde(rate_data, country_cfg):
                          'RATE_BASE': round(flat * mp, 4)})
 
     for pc, tiers in _upde_service_buckets(rate_data, 'EXPRESS_SAVER', country_cfg):
-        for each_w, rate, per_kg in collapse_same_rate_tiers(tiers, max_ew):
-            if each_w > max_ew or per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                rows.append({**c0, 'POSTCODE': pc, 'SERVICE_LEVEL': 'EXPRESS SAVER',
-                             'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                             'RATE_BASE': round(rate * mp, 4)})
+        # EXPRESS SAVER is billed on the TOTAL shipment payweight (one lookup),
+        # not per parcel — use the full total-payweight bands (no max_ew cap).
+        bands = collapse_same_rate_tiers(tiers)
+        rows += build_combined_weight_rows(c0, bands, max_p, 'EXPRESS SAVER',
+                                           max_ew=max_ew, postcode=pc)
 
     # ---- WorldEase (WEA): flat per-country rate (CH, NO) ----
     wea = rate_data.get('WEA')
@@ -855,14 +881,10 @@ def build_rows_dhl(rate_data, country_cfg):
                              'RATE_BASE': round(total, 4)})
         return rows
 
-    for each_w, rate, per_kg in collapse_same_rate_tiers(
-            rate_data.get('STANDARD', []), max_ew):
-        if each_w > max_ew or per_kg:
-            continue
-        for mp in range(1, max_p + 1):
-            rows.append({**c0, 'SERVICE_LEVEL': 'STANDARD',
-                         'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                         'RATE_BASE': round(rate * mp, 4)})
+    # DHL "Other countries" is a TOTAL-payweight table (one lookup per shipment),
+    # not a per-parcel table — use the full bands (no max_ew cap) and price once.
+    bands = collapse_same_rate_tiers(rate_data.get('STANDARD', []))
+    rows += build_combined_weight_rows(c0, bands, max_p, 'STANDARD', max_ew=max_ew)
     return rows
 
 
@@ -884,6 +906,8 @@ def build_rows_dpd(rate_data, country_cfg):
 
 
 def build_rows_upsnl(rate_data, country_cfg):
+    # EXPRESS SAVER is billed on the TOTAL shipment payweight (one lookup),
+    # so every zone uses combined-weight rows (no per-parcel * mp, no max_ew cap).
     rows   = []
     max_p  = country_cfg['max_parcel_count']
     max_ew = country_cfg['max_each_weight_kg']
@@ -892,42 +916,29 @@ def build_rows_upsnl(rate_data, country_cfg):
                      'UPSNL', country_cfg['iso2'])
 
     zones = rate_data.get('zones', [])
-    bands_by_zone = {z: collapse_same_rate_tiers(t, max_ew)
+    bands_by_zone = {z: collapse_same_rate_tiers(t)
                      for z, t in rate_data.get('rates_by_zone', {}).items()}
 
-    # No zone table at all → no postcode, use zone 1 (or first available)
+    def emit(zone, pc):
+        return build_combined_weight_rows(
+            c0, bands_by_zone.get(zone, []), max_p, 'EXPRESS SAVER',
+            max_ew=max_ew, postcode=pc)
+
+    # No zone table at all → no postcode, use first available zone
     if not zones:
-        fallback_zone = next(iter(bands_by_zone), None)
-        if fallback_zone is None:
-            return rows
-        for each_w, rate, per_kg in bands_by_zone[fallback_zone]:
-            if each_w > max_ew or per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                rows.append({**c0, 'POSTCODE': None, 'SERVICE_LEVEL': 'EXPRESS SAVER',
-                             'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                             'RATE_BASE': round(rate * mp, 4)})
-        return rows
+        zone = next(iter(bands_by_zone), None)
+        return emit(zone, None) if zone is not None else rows
 
     # Has pc_from/pc_to ranges → map each prefix to a zone
     has_pc_ranges = any('pc_from' in z and 'pc_to' in z for z in zones)
-
     if not has_pc_ranges:
         # Single-zone entry without postcode ranges → no postcode column
-        zone = zones[0].get('zone')
-        for each_w, rate, per_kg in bands_by_zone.get(zone, []):
-            if each_w > max_ew or per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                rows.append({**c0, 'POSTCODE': None, 'SERVICE_LEVEL': 'EXPRESS SAVER',
-                             'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                             'RATE_BASE': round(rate * mp, 4)})
-        return rows
+        return emit(zones[0].get('zone'), None)
 
     # Worst-zone fallback for prefixes not covered by the table
     def _zone_max_rate(zid):
         return max((r for _, r, _ in bands_by_zone.get(zid, [])), default=0)
-    all_zone_ids = [z['zone'] for z in zones if 'zone' in z]
+    all_zone_ids  = [z['zone'] for z in zones if 'zone' in z]
     fallback_zone = max(all_zone_ids, key=_zone_max_rate) if all_zone_ids else None
 
     prefix_to_zone = {}
@@ -941,24 +952,10 @@ def build_rows_upsnl(rate_data, country_cfg):
 
     unique_zones = set(prefix_to_zone.values())
     if len(unique_zones) <= 1:
-        zone = next(iter(unique_zones), fallback_zone)
-        for each_w, rate, per_kg in bands_by_zone.get(zone, []):
-            if each_w > max_ew or per_kg:
-                continue
-            for mp in range(1, max_p + 1):
-                rows.append({**c0, 'POSTCODE': None, 'SERVICE_LEVEL': 'EXPRESS SAVER',
-                             'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                             'RATE_BASE': round(rate * mp, 4)})
+        rows += emit(next(iter(unique_zones), fallback_zone), None)
     else:
         for pc_prefix, zone in prefix_to_zone.items():
-            for each_w, rate, per_kg in bands_by_zone.get(zone, []):
-                if each_w > max_ew or per_kg:
-                    continue
-                for mp in range(1, max_p + 1):
-                    rows.append({**c0, 'POSTCODE': pc_prefix,
-                                 'SERVICE_LEVEL': 'EXPRESS SAVER',
-                                 'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                                 'RATE_BASE': round(rate * mp, 4)})
+            rows += emit(zone, pc_prefix)
     return rows
 
 
@@ -1004,48 +1001,22 @@ def build_rows_upsgb(rate_data, country_cfg):
     max_ew = country_cfg['max_each_weight_kg']
     c0     = _common(country_cfg['site_id'], country_cfg['client_id'],
                      'UPSGB', country_cfg['iso2'])
-    seen = set()
 
-    # STDS — per-parcel pricing
-    for each_w, rate, per_kg in collapse_same_rate_tiers(
-            rate_data.get('STDS', []), max_ew):
-        if each_w > max_ew or per_kg:
-            continue
-        for mp in range(1, max_p + 1):
-            rb  = rate * mp
-            key = (mp, each_w, round(rb, 4))
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({**c0, 'SERVICE_LEVEL': 'STANDARD',
-                         'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                         'RATE_BASE': round(rb, 4)})
+    # STANDARD — combined weight: mp=1 priced on STDS (single), mp>=2 on STDM
+    # (multi, total-weight). One rate lookup per band, never rate * parcel_count.
+    bands_stds = collapse_same_rate_tiers(rate_data.get('STDS', []))
+    rows += build_combined_weight_rows(
+        c0, bands_stds, max_parcel=1, service_level='STANDARD',
+        max_ew=max_ew, user_def_type_2='single')
 
-    # STDM — combined-weight pricing
-    for combined_w, rate, per_kg in collapse_same_rate_tiers(rate_data.get('STDM', [])):
-        if per_kg:
-            continue
-        for mp in range(1, max_p + 1):
-            each_w = combined_w / mp
-            if each_w not in country_cfg['each_weight_grid'] or each_w > max_ew:
-                continue
-            key = (mp, each_w, round(rate, 4))
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({**c0, 'SERVICE_LEVEL': 'STANDARD',
-                         'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                         'RATE_BASE': round(rate, 4)})
+    bands_stdm = collapse_same_rate_tiers(rate_data.get('STDM', []))
+    rows += build_combined_weight_rows(
+        c0, bands_stdm, max_p, service_level='STANDARD',
+        max_ew=max_ew, user_def_type_2='multi', min_parcel=2)
 
-    # EXPS — express saver
-    for each_w, rate, per_kg in collapse_same_rate_tiers(
-            rate_data.get('EXPS', []), max_ew):
-        if each_w > max_ew or per_kg:
-            continue
-        for mp in range(1, max_p + 1):
-            rows.append({**c0, 'SERVICE_LEVEL': 'EXPRESS SAVER',
-                         'MAX_PARCEL': mp, 'EACH_WEIGHT': each_w,
-                         'RATE_BASE': round(rate * mp, 4)})
+    # EXPS — express saver: billed on TOTAL shipment payweight (one lookup).
+    bands = collapse_same_rate_tiers(rate_data.get('EXPS', []))
+    rows += build_combined_weight_rows(c0, bands, max_p, 'EXPRESS SAVER', max_ew=max_ew)
     return rows
 
 
@@ -1122,7 +1093,7 @@ COLUMN_ORDER = [
     'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
     'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
     'USER_DEF_TYPE_2',
-    'USER_DEF_TYPE_4 (max 1,5m)', 'RATE_BASE', 'RATE_EXTRA',
+    'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD', 'RATE_BASE', 'RATE_EXTRA',
     'FUEL', 'MAUT', 'Linehaul UPSDE', 'TOTAL_PRICE',
 ]
 COL_LETTER = {name: openpyxl.utils.get_column_letter(i + 1)
@@ -1325,8 +1296,8 @@ def optimize_globally(input_path, output_path):
 #     'constraint_col': 'USER_DEF_TYPE_4 (max 1,5m)',
 #     'normal_value':   1.5,           # stamped on the cheap base rows
 #     'bucket_value':   None,          # value on the bucket twin (None = catch-all)
-#     'flag_col':       None,          # optional flag column; None = no flag (AWKWARD removed)
-#     'flag_value':     'y',           # only used if flag_col is set
+#     'flag_col':       'AWKWARD',     # column flagged on the bucket twin
+#     'flag_value':     'y',
 #     'surcharge':      6.0,           # euros
 #     'surcharge_mode': 'per_parcel',  # 'per_parcel' (× MAX_PARCEL) or 'flat'
 #   }
@@ -1413,7 +1384,7 @@ def add_overflow_buckets(df, rules, carrier_defaults=None, country_cfg=None):
         EACH_WEIGHT = blank
         RATE_BASE  = overflow_rate * n       (overflow_rate is manager-supplied)
         RATE_EXTRA = surcharge * n
-        flag       = optional (flag_col defaults to None — no flag column)
+        flag       = AWKWARD = 'Y'
 
     The overflow_rate is NOT inferred from the grid (the example used a hand-set
     heavy/per-kg rate); it must be provided in the rule. Rows are flagged so ops
@@ -1435,7 +1406,7 @@ def add_overflow_buckets(df, rules, carrier_defaults=None, country_cfg=None):
         except (TypeError, ValueError, KeyError):
             log.warning('overflow rule skipped — no valid overflow_rate'); continue
         sur      = float(rule.get('surcharge', 0) or 0)
-        flag_col = rule.get('flag_col')
+        flag_col = rule.get('flag_col', 'AWKWARD')
         flag_val = rule.get('flag_value', 'Y')
 
         base = df[~df['_is_bucket']]
@@ -1471,10 +1442,8 @@ def add_overflow_buckets(df, rules, carrier_defaults=None, country_cfg=None):
                     'EACH_WEIGHT': None,   'MAX_VOLUME': None, 'EACH_VOLUME': None,
                     'RATE_BASE': rb,       'RATE_EXTRA': round(sur * n, 4),
                     'FUEL': fuel,          'MAUT': maut, 'Linehaul UPSDE': lh,
-                    '_is_bucket': True,
+                    flag_col: flag_val,    '_is_bucket': True,
                 })
-                if flag_col:
-                    row[flag_col] = flag_val
                 row['TOTAL_PRICE'] = round(rb + sur * n + fuel + maut + (lh or 0), 4)
                 new.append(row)
 
@@ -1498,7 +1467,7 @@ def add_postcode_catchall(df, rules, carrier_defaults=None):
         if not rule.get('enabled', True):
             continue
         sur      = float(rule.get('surcharge', 0) or 0)
-        flag_col = rule.get('flag_col')
+        flag_col = rule.get('flag_col', 'AWKWARD')
         flag_val = rule.get('flag_value', 'Y')
 
         base = df[(~df['_is_bucket']) & (df['POSTCODE'].notna())]
@@ -1514,8 +1483,7 @@ def add_postcode_catchall(df, rules, carrier_defaults=None):
         worst = base.loc[base.groupby(keys)['TOTAL_PRICE'].idxmax()].copy()
         worst['POSTCODE']   = None
         worst['RATE_EXTRA'] = worst['RATE_EXTRA'].fillna(0) + sur
-        if flag_col:
-            worst[flag_col] = flag_val
+        worst[flag_col]     = flag_val
         worst['_is_bucket'] = True
         new.append(worst)
 
@@ -1555,7 +1523,8 @@ def optimize_globally_df(df):
 
 def run_pipeline(input_path, country, output_dir='.',
                  country_cfg=None, carrier_defaults=None, variables_layout=None,
-                 exceptions=None, overflow_rules=None, postcode_rules=None):
+                 exceptions=None, overflow_rules=None, postcode_rules=None,
+                 pallet_max_band_kg=None):
     """
     Full pipeline for one country.
 
@@ -1583,7 +1552,8 @@ def run_pipeline(input_path, country, output_dir='.',
     log.info('=== Pipeline for %s ===', country)
     parsed = parse_rate_cards(input_path)
     return run_pipeline_from_parsed(parsed, country, output_dir, cfg, cd, vl,
-                                    exceptions, overflow_rules, postcode_rules)
+                                    exceptions, overflow_rules, postcode_rules,
+                                    pallet_max_band_kg=pallet_max_band_kg)
 
 
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
@@ -1619,32 +1589,21 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
     df_pal_opt = pd.DataFrame()
     pallet_warn = None
     if pallet_zones:
-        bands = sorted({int(b) for zmap in pallet_zones.values() for b in zmap})
-        # Optional weight cap: drop every band whose ceiling exceeds the cap, so
-        # pallets heavier than it simply get no DHL-FENDER row. Bands come from
-        # the rate-card headers; this trims them without touching the source file.
-        if pallet_max_band_kg:
-            cap  = int(pallet_max_band_kg)
-            kept = [b for b in bands if b <= cap]
-            if len(kept) < len(bands):
-                log.info('pallet band cap %d kg: %d → %d bands (top now %s)',
-                         cap, len(bands), len(kept),
-                         kept[-1] if kept else 'none')
-            bands = kept
-
-        if not bands:
-            pallet_warn = (f"⚠️ DHL-FENDER: pallet weight cap "
-                           f"({int(pallet_max_band_kg)} kg) is below the smallest "
-                           f"rate-card band for {country} — no pallet rows built.")
-        else:
-            df_pal_ext, maut_known = build_pallet_df(
-                country, pallet_zones, bands,
-                pallet_defaults, pallet_overrides, pallet_maut)
-            df_pal_opt = collapse_pallet_bands(df_pal_ext)
-            if not maut_known and not df_pal_ext.empty:
-                pallet_warn = (f"⚠️ DHL-FENDER: MAUT % unknown for {country} — pallet "
-                               f"MAUT set to 0. Add it in the pallet MAUT table.")
-            log.info('pallet rows: %d ext / %d collapsed', len(df_pal_ext), len(df_pal_opt))
+        try:
+            import pallet_parser as _pp
+            bands = sorted({int(b) for zmap in pallet_zones.values() for b in zmap})
+        except Exception:
+            bands = sorted({int(b) for zmap in pallet_zones.values() for b in zmap})
+        if pallet_max_band_kg:                       # configurable max pallet weight
+            bands = [b for b in bands if b <= pallet_max_band_kg]
+        df_pal_ext, maut_known = build_pallet_df(
+            country, pallet_zones, bands,
+            pallet_defaults, pallet_overrides, pallet_maut)
+        df_pal_opt = collapse_pallet_bands(df_pal_ext)
+        if not maut_known and not df_pal_ext.empty:
+            pallet_warn = (f"⚠️ DHL-FENDER: MAUT % unknown for {country} — pallet "
+                           f"MAUT set to 0. Add it in the pallet MAUT table.")
+        log.info('pallet rows: %d ext / %d collapsed', len(df_pal_ext), len(df_pal_opt))
 
     if df.empty and df_pal_ext.empty:
         raise ValueError(f"No rows built for {country} — no matching parcel or "
@@ -1699,14 +1658,13 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
     else:
         write_matrix_excel(df, ext_path, cfg, cd, vl)
         write_matrix_excel(df_opt, opt_path, cfg, cd, vl)
-        write_matrix_excel(df_min_final, min_path, cfg, cd, vl)
-        rows_ext, rows_opt, rows_min = (len(df), len(df_opt), len(df_min_final))
-        # Use the in-memory numeric frame for the combined export. Reloading the
-        # written file with pd.read_excel would return openpyxl FORMULA strings
-        # (e.g. MAUT = "=Variables!$B$9*…"), not numbers — those then collapse to
-        # the combined sheet's shared default MAUT (5%/6%). df_min_final already
-        # carries the correct per-country numeric MAUT.
-        minimal_frame = df_min_final
+        stats = optimize_globally(opt_path, min_path)
+        rows_ext, rows_opt, rows_min = len(df), len(df_opt), stats['output_rows']
+        # reload the written minimal frame so the combined export has numerics
+        try:
+            minimal_frame = pd.read_excel(min_path, sheet_name=0)
+        except Exception:
+            minimal_frame = df_min
 
     # Persist the minimal numeric frame for the combined-workbook export.
     min_df_path = out / f'{country}_Matrix_minimal.pkl'
@@ -1791,7 +1749,7 @@ PALLET_COLUMN_ORDER = [
     'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
     'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
     'FACTORED RATE PALLET', 'USER_DEF_TYPE_1', 'USER_DEF_TYPE_2',
-    'USER_DEF_TYPE_4 (max 1,5m)',
+    'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD',
     'RATE_BASE', 'RATE_EXTRA', 'MOBILITY', 'FUEL', 'MAUT', 'Linehaul UPSDE',
     'TOLL', 'ADMIN', 'TOTAL_PRICE',
 ]
@@ -1851,7 +1809,7 @@ def build_pallet_df(country, zip_rate_map, band_ceilings,
                 'EACH_WEIGHT': None, 'EACH_VOLUME': None,
                 'FACTORED RATE PALLET': rate_base,
                 'USER_DEF_TYPE_1': None, 'USER_DEF_TYPE_2': None,
-                'USER_DEF_TYPE_4 (max 1,5m)': None,
+                'USER_DEF_TYPE_4 (max 1,5m)': None, 'AWKWARD': None,
                 'RATE_BASE': rate_base, 'RATE_EXTRA': 0,
                 'MOBILITY': mob, 'FUEL': fuel, 'MAUT': maut,
                 'Linehaul UPSDE': None, 'TOLL': toll, 'ADMIN': admin,
@@ -2087,11 +2045,9 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
             if cfg.get('fuel_variables_ref'):
                 ref = cfg['fuel_variables_ref']
                 formulas['FUEL'] = f"=Variables!${ref[0]}${ref[1:]}*{L_RATE}{ri}"
-            # NB: parcel MAUT (DHL-ROS / DPD) varies PER COUNTRY, but the combined
-            # sheet has a single Variables sheet — one B8/B9 cell can't represent
-            # every country. So we keep the per-country numeric MAUT already in the
-            # frame rather than overwriting it with a single-cell formula. (FUEL is
-            # a flat global %, so its formula stays correct for every country.)
+            if cfg.get('maut_variables_ref'):
+                ref = cfg['maut_variables_ref']
+                formulas['MAUT'] = f"=Variables!${ref[0]}${ref[1:]}*{L_RATE}{ri}"
             parts = [f"{L_RATE}{ri}"]
             if L_EXTRA: parts.append(f"{L_EXTRA}{ri}")
             parts.append(f"{L_FUEL}{ri}")
