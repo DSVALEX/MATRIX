@@ -131,7 +131,7 @@ COUNTRY_CONFIG = {iso: _default_country_cfg(iso) for iso in [
     'AT', 'CH', 'PL', 'CZ', 'SK', 'HU', 'SI',
     'SE', 'DK', 'NO', 'FI',
     'GR', 'HR', 'BG', 'RO', 'SM',
-    'EE', 'LV', 'LT', 'LI'
+    'EE', 'LV', 'LT',
 ]}
 # DE only has three carriers (no UPSNL)
 COUNTRY_CONFIG['DE']['carriers'] = ['UPDE', 'DPD', 'DHL-ROS']
@@ -1647,13 +1647,14 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         write_matrix_with_formulas(min_all, min_path, cfg, cd, vl, pallet_maut,
                                    pallet_defaults)
         rows_ext, rows_opt, rows_min = len(ext_all), len(opt_all), len(min_all)
-        minimal_frame = min_all
+        extended_frame, optimized_frame, minimal_frame = ext_all, opt_all, min_all
     elif any_buckets:
         write_matrix_excel(df_ext_final, ext_path, cfg, cd, vl)
         write_matrix_excel(df_opt_final, opt_path, cfg, cd, vl)
         write_matrix_excel(df_min_final, min_path, cfg, cd, vl)
         rows_ext, rows_opt, rows_min = (len(df_ext_final), len(df_opt_final),
                                         len(df_min_final))
+        extended_frame, optimized_frame = df_ext_final, df_opt_final
         minimal_frame = df_min_final
     else:
         write_matrix_excel(df, ext_path, cfg, cd, vl)
@@ -1665,14 +1666,21 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
             minimal_frame = pd.read_excel(min_path, sheet_name=0)
         except Exception:
             minimal_frame = df_min
+        # extended/optimized are still the numeric in-memory frames
+        extended_frame, optimized_frame = df, df_opt
 
-    # Persist the minimal numeric frame for the combined-workbook export.
-    min_df_path = out / f'{country}_Matrix_minimal.pkl'
-    try:
-        minimal_frame.to_pickle(min_df_path)
-        min_df_str = str(min_df_path)
-    except Exception:
-        min_df_str = None
+    # Persist the numeric stage frames for the combined-workbook export.
+    def _persist_frame(frame, name):
+        path = out / f'{country}_Matrix_{name}.pkl'
+        try:
+            frame.to_pickle(path)
+            return str(path)
+        except Exception:
+            return None
+
+    ext_df_str = _persist_frame(extended_frame,  'extended')
+    opt_df_str = _persist_frame(optimized_frame, 'optimized')
+    min_df_str = _persist_frame(minimal_frame,   'minimal')
 
     log.info('=== Done %s: %d ext / %d opt / %d min ===',
              country, rows_ext, rows_opt, rows_min)
@@ -1680,6 +1688,8 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         'extended':       str(ext_path),
         'optimized':      str(opt_path),
         'minimal':        str(min_path),
+        'extended_df':    ext_df_str,
+        'optimized_df':   opt_df_str,
         'minimal_df':     min_df_str,
         'rows_extended':  rows_ext,
         'rows_optimized': rows_opt,
