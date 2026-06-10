@@ -1707,7 +1707,7 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
 # These rates are already FACTORED. The cost stack on top (verified to the cent
 # against ITFRDE_final_for_Fender_Pallets.xlsx):
 #
-#   RATE_BASE = factored_rate * FACTOR_DHL
+#   RATE_BASE = factored_rate / FACTOR_DHL
 #   FUEL      = fuel_pct      * RATE_BASE        (global)
 #   MOBILITY  = mobility_pct  * RATE_BASE        (global)
 #   MAUT      = maut_pct(country, band) * RATE_BASE   (per-country, 2-tier)
@@ -1726,7 +1726,7 @@ PALLET_DEFAULTS = {
         'fuel_pct':           0.155,   # FUEL DHL PALLET
         'mobility_pct':       0.04,    # MOBILITY PALLET
         'admin_per_shipment': 46.51,   # ADMIN PALLET (€, applies to every row)
-        'factor':             1.0,     # FACTOR DHL (rates already factored)
+        'factor':             4.13,     # FACTOR DHL (rates already factored)
         'toll_pct':           0.0,     # default no toll; GB set in overrides
     },
 }
@@ -1802,7 +1802,7 @@ def build_pallet_df(country, zip_rate_map, band_ceilings,
             rate = band_map.get(ceil)
             if rate is None:
                 continue
-            rate_base = round(rate * factor, 6)
+            rate_base = round(rate / factor, 6)
             fuel = round(fuel_pct * rate_base, 6)
             mob  = round(mob_pct * rate_base, 6)
             maut_pct = _pallet_maut_for(iso, ceil, mt) or 0.0
