@@ -131,7 +131,7 @@ COUNTRY_CONFIG = {iso: _default_country_cfg(iso) for iso in [
     'AT', 'CH', 'PL', 'CZ', 'SK', 'HU', 'SI',
     'SE', 'DK', 'NO', 'FI',
     'GR', 'HR', 'BG', 'RO', 'SM',
-    'EE', 'LV', 'LT',
+    'EE', 'LV', 'LT', 'LI'
 ]}
 # DE only has three carriers (no UPSNL)
 COUNTRY_CONFIG['DE']['carriers'] = ['UPDE', 'DPD', 'DHL-ROS']
