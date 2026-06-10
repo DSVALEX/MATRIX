@@ -129,6 +129,9 @@ DEFAULT_EXCEPTIONS = pd.DataFrame([
     {'Enabled': True, 'Carrier': 'DPD',  'Country (blank=all)': '',
      'Service level (blank=all)': '',
      'Size limit (m)': 1.75, 'Surcharge €/parcel': 46.5},
+     {'Enabled': True, 'Carrier': 'DHL-ROS',  'Country (blank=all)': '',
+     'Service level (blank=all)': '',
+     'Size limit (m)': 1, 'Surcharge €/parcel': 8.63},
 ])
 
 
