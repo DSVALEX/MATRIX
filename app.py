@@ -394,7 +394,7 @@ with st.sidebar:
                 'Admin € / shipment', min_value=0.0,
                 value=float(_pd['admin_per_shipment']), step=1.0, format="%.2f", key='pal_admin')
         pallet_vals['factor'] = st.number_input(
-            'Factor (× pallet rate)', min_value=0.0001,
+            'Factor', min_value=0.0001,
             value=float(_pd['factor']), step=0.01, format="%.4f", key='pal_factor')
         pallet_max_band_kg = st.number_input(
             'Max pallet weight (kg)  —  0 = no cap', min_value=0,
