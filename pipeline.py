@@ -1957,7 +1957,7 @@ def write_matrix_numeric(df, output_path, country_cfg, variables_layout=None,
         ws.cell(1, ci, col)
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
     fill        = PatternFill('solid', fgColor='FFF2CC')   # pale amber = catch-all bucket
-    pallet_fill = PatternFill('solid', fgColor='FFC000')   # orange = pallet (DHL-FENDER) row
+    pallet_fill = PatternFill('solid', fgColor='0070C0')   # orange = pallet (DHL-FENDER) row
     for ri, rec in enumerate(df_sorted.to_dict('records'), start=2):
         is_bucket = bool(rec.get('_is_bucket'))
         is_pallet = (rec.get('CARRIER_ID') == 'DHL-FENDER')
