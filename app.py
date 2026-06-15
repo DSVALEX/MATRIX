@@ -72,7 +72,7 @@ def variables_layout(fuel_vals, maut_dhl, maut_dpd, pallet_vals=None):
         ('MOBILITY PALLET', pv.get('mobility', 0.04)),        # B12
         ('TOLL UK PALLET',  pv.get('toll',     0.0043)),      # B13
         ('ADMIN PALLET',    pv.get('admin',    46.51)),       # B14
-        ('FACTOR DHL',      pv.get('factor',   1.0)),         # B15
+        ('FACTOR DHL',      pv.get('factor',   4.13)),         # B15
     ]
 
 
@@ -109,11 +109,12 @@ def persist(result):
         dst = Path(out) / Path(result[key]).name
         shutil.copy(result[key], dst)
         result[key] = str(dst)
-    # Carry the minimal numeric frame (used to build the combined workbook)
-    if result.get('minimal_df'):
-        dst = Path(out) / Path(result['minimal_df']).name
-        shutil.copy(result['minimal_df'], dst)
-        result['minimal_df'] = str(dst)
+    # Carry the numeric stage frames (used to build the combined workbooks)
+    for key in ('extended_df', 'optimized_df', 'minimal_df'):
+        if result.get(key):
+            dst = Path(out) / Path(result[key]).name
+            shutil.copy(result[key], dst)
+            result[key] = str(dst)
     return result
 
 
@@ -128,6 +129,9 @@ DEFAULT_EXCEPTIONS = pd.DataFrame([
     {'Enabled': True, 'Carrier': 'DPD',  'Country (blank=all)': '',
      'Service level (blank=all)': '',
      'Size limit (m)': 1.75, 'Surcharge €/parcel': 46.5},
+     {'Enabled': True, 'Carrier': 'DHL-ROS',  'Country (blank=all)': '',
+     'Service level (blank=all)': '',
+     'Size limit (m)': 1, 'Surcharge €/parcel': 8.63},
 ])
 
 
@@ -216,6 +220,47 @@ def postcode_rules_from_editor(edited_df):
     return rules
 
 
+# ── Heavy / oversized parcel (per-parcel weight surcharge) ────────────────────
+# A per-parcel weight threshold. Unlike the oversize (size) rule it must not
+# overwrite EACH_WEIGHT, so it maps to a mode='threshold' exception rule that
+# surcharges, in place, every row whose per-box cap reaches the threshold.
+DEFAULT_HEAVY = pd.DataFrame([
+    {'Enabled': True, 'Carrier': 'DHL-ROS', 'Country (blank=all)': '',
+     'Weight threshold kg': 20.0, 'Surcharge €/parcel': 4.89},
+])
+
+
+def heavy_rules_from_editor(edited_df):
+    rules = []
+    for _, row in edited_df.iterrows():
+        if not bool(row.get('Enabled', False)):
+            continue
+        try:
+            thr = float(row.get('Weight threshold kg'))
+        except (TypeError, ValueError):
+            continue
+        try:
+            sur = float(row.get('Surcharge €/parcel') or 0)
+        except (TypeError, ValueError):
+            sur = 0.0
+        carrier = str(row.get('Carrier', '') or '').strip()
+        country = str(row.get('Country (blank=all)', '') or '').strip().upper()
+        rules.append({
+            'enabled':        True,
+            'mode':           'threshold',
+            'label':          f'Heavy parcel {carrier or "ALL"} ≥{thr:g}kg',
+            'carriers':       [carrier] if carrier and carrier != '(all)' else [],
+            'countries':      [c.strip() for c in country.split(',') if c.strip()],
+            'constraint_col': 'EACH_WEIGHT',
+            'threshold':      thr,
+            'flag_col':       'AWKWARD',
+            'flag_value':     'y',
+            'surcharge':      sur,
+            'surcharge_mode': 'per_parcel',
+        })
+    return rules
+
+
 # ── Pallet MAUT editor helpers ────────────────────────────────────────────────
 
 def _default_pallet_maut_df():
@@ -254,13 +299,16 @@ def make_zip(results):
     return buf.read()
 
 
-def make_combined(results, variables_layout_rows, pallet_maut=None,
-                  pallet_defaults=None, carrier_defaults=None):
-    """Build ONE workbook with every country's minimal matrix in a single sheet,
-    with live formulas (per-country pallet MAUT cells written into Variables)."""
+def make_combined(results, variables_layout_rows, stage='minimal',
+                  pallet_maut=None, pallet_defaults=None, carrier_defaults=None):
+    """Build ONE workbook with every country's matrix (for the given stage:
+    'extended', 'optimized' or 'minimal') in a single sheet. Written numerically
+    so each country keeps its own per-country surcharges (MAUT differs by country
+    and can't be a single shared Variables formula)."""
+    key = f'{stage}_df'
     frames = []
     for country, r in results.items():
-        p = r.get('minimal_df')
+        p = r.get(key)
         if p and Path(p).exists():
             try:
                 frames.append(pd.read_pickle(p))
@@ -268,7 +316,7 @@ def make_combined(results, variables_layout_rows, pallet_maut=None,
                 pass
     if not frames:
         return None
-    out = Path(tempfile.mkdtemp()) / 'Combined_Matrix_minimal.xlsx'
+    out = Path(tempfile.mkdtemp()) / f'Combined_Matrix_{stage}.xlsx'
     # Numeric, not formulas: a single shared sheet can't carry per-country MAUT
     # (DPD/DHL differ by country). Formulas would reference one Variables cell and
     # apply the same % to every country. Numeric values keep each country correct.
@@ -387,7 +435,7 @@ with st.sidebar:
                 'Admin € / shipment', min_value=0.0,
                 value=float(_pd['admin_per_shipment']), step=1.0, format="%.2f", key='pal_admin')
         pallet_vals['factor'] = st.number_input(
-            'Factor (× pallet rate)', min_value=0.0001,
+            'Factor', min_value=0.0001,
             value=float(_pd['factor']), step=0.01, format="%.4f", key='pal_factor')
         pallet_max_band_kg = st.number_input(
             'Max pallet weight (kg)  —  0 = no cap', min_value=0,
@@ -446,28 +494,28 @@ else:
     selectable = ALL_COUNTRIES
     st.caption("Choose which countries to generate matrices for.")
 
-if 'country_selection' not in st.session_state:
-    st.session_state.country_selection = {}
+# Checkbox state lives under the widget keys themselves (chk_<country>). The
+# Select all / Clear buttons render *before* the checkboxes, so they may seed
+# those keys directly; a keyed checkbox ignores `value=` on rerun and reads its
+# state from session_state, which is why writing to a separate dict did nothing.
 for c in selectable:
-    st.session_state.country_selection.setdefault(c, False)
+    st.session_state.setdefault(f'chk_{c}', False)
 
 ca, cb, *_ = st.columns([1, 1, 8])
 if ca.button("Select all"):
     for c in selectable:
-        st.session_state.country_selection[c] = True
+        st.session_state[f'chk_{c}'] = True
 if cb.button("Clear"):
     for c in selectable:
-        st.session_state.country_selection[c] = False
+        st.session_state[f'chk_{c}'] = False
 
 COLS = 10
 grid = st.columns(COLS)
 for i, country in enumerate(selectable):
     with grid[i % COLS]:
-        st.session_state.country_selection[country] = st.checkbox(
-            country, value=st.session_state.country_selection.get(country, False),
-            key=f'chk_{country}')
+        st.checkbox(country, key=f'chk_{country}')
 
-selected = [c for c in selectable if st.session_state.country_selection.get(c)]
+selected = [c for c in selectable if st.session_state.get(f'chk_{c}')]
 
 # ── Advanced per-country settings ─────────────────────────────────────────────
 if selected:
@@ -572,6 +620,30 @@ with st.expander("📐 Exceptions & buckets — oversize / surcharges per carrie
         }, key='postcode_editor')
     st.session_state.postcode_df = pc_edit
 
+    st.markdown('---')
+    st.markdown("**Heavy / oversized parcel** — per-parcel **weight** surcharge. "
+                "Any row whose per-box cap (EACH_WEIGHT) reaches the threshold is "
+                "surcharged €/parcel × parcels, flagged (AWKWARD) and shown in amber. "
+                "It does **not** overwrite the weight grid. Default: DHL parcels "
+                "≥ 20 kg → €4.89/parcel. Note: a heavy parcel that is *also* over a "
+                "size limit is charged the size surcharge only (rare).")
+    if 'heavy_df' not in st.session_state:
+        st.session_state.heavy_df = DEFAULT_HEAVY.copy()
+    hv_edit = st.data_editor(
+        st.session_state.heavy_df, num_rows="dynamic",
+        use_container_width=True, hide_index=True,
+        column_config={
+            'Enabled': st.column_config.CheckboxColumn(width="small"),
+            'Carrier': st.column_config.SelectboxColumn(
+                options=['(all)'] + list(pl.CARRIER_DEFAULTS), width="small"),
+            'Country (blank=all)': st.column_config.TextColumn(width="small"),
+            'Weight threshold kg': st.column_config.NumberColumn(
+                format="%.1f", help="Surcharge rows whose per-box cap can hold a "
+                                    "parcel at/over this weight."),
+            'Surcharge €/parcel': st.column_config.NumberColumn(format="%.2f"),
+        }, key='heavy_editor')
+    st.session_state.heavy_df = hv_edit
+
 st.divider()
 
 # ── Run ────────────────────────────────────────────────────────────────────────
@@ -583,6 +655,8 @@ if run_btn and uploaded and selected:
     input_path = st.session_state['input_path']
     errors = {}
     rules    = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
+    hv_rules = heavy_rules_from_editor(st.session_state.get('heavy_df', DEFAULT_HEAVY))
+    rules    = rules + hv_rules   # heavy (threshold) rules evaluated after oversize (stamp)
     ov_rules = overflow_rules_from_editor(st.session_state.get('overflow_df', DEFAULT_OVERFLOW))
     pc_rules = postcode_rules_from_editor(st.session_state.get('postcode_df', DEFAULT_POSTCODE))
     pallets  = st.session_state.get('pallets')   # None if no pallet card uploaded
@@ -696,18 +770,25 @@ if st.session_state.results:
                            type="primary")
     with dc2:
         _vl_rows = st.session_state.get('variables_layout_rows', pl.VARIABLES_LAYOUT)
-        _combined = make_combined(
-            results, _vl_rows,
-            pallet_maut=st.session_state.get('pallet_maut_table'),
-            pallet_defaults=st.session_state.get('pallet_defaults_used'),
-            carrier_defaults=st.session_state.get('carrier_defaults_used'))
-        if _combined is not None:
-            st.download_button(
-                "🧩 Download combined (all countries, one sheet)",
-                data=_combined, file_name="Combined_Matrix_minimal.xlsx",
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                help="Every selected country's minimal matrix merged into a single "
-                     "sheet, sorted by country then price. Values are written numeric "
-                     "so per-country surcharges stay correct.")
-        else:
-            st.caption("Combined export unavailable — re-run to regenerate.")
+        _xlsx_mime = ('application/vnd.openxmlformats-officedocument.'
+                      'spreadsheetml.sheet')
+        st.caption("🧩 **Combined** — every selected country merged into one sheet, "
+                   "sorted by country then price. Numeric values so per-country "
+                   "surcharges (e.g. MAUT) stay correct.")
+        _stages = [('extended',  '🧩 Combined extended'),
+                   ('optimized', '🧩 Combined optimized'),
+                   ('minimal',   '🧩 Combined minimal')]
+        for _stage, _label in _stages:
+            _combined = make_combined(
+                results, _vl_rows, stage=_stage,
+                pallet_maut=st.session_state.get('pallet_maut_table'),
+                pallet_defaults=st.session_state.get('pallet_defaults_used'),
+                carrier_defaults=st.session_state.get('carrier_defaults_used'))
+            if _combined is not None:
+                st.download_button(
+                    _label, data=_combined,
+                    file_name=f"Combined_Matrix_{_stage}.xlsx", mime=_xlsx_mime,
+                    key=f'dl_combined_{_stage}',
+                    type=('primary' if _stage == 'minimal' else 'secondary'))
+            else:
+                st.caption(f"Combined {_stage} unavailable — re-run to regenerate.")
