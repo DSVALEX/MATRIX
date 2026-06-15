@@ -220,6 +220,47 @@ def postcode_rules_from_editor(edited_df):
     return rules
 
 
+# ── Heavy / oversized parcel (per-parcel weight surcharge) ────────────────────
+# A per-parcel weight threshold. Unlike the oversize (size) rule it must not
+# overwrite EACH_WEIGHT, so it maps to a mode='threshold' exception rule that
+# surcharges, in place, every row whose per-box cap reaches the threshold.
+DEFAULT_HEAVY = pd.DataFrame([
+    {'Enabled': True, 'Carrier': 'DHL-ROS', 'Country (blank=all)': '',
+     'Weight threshold kg': 20.0, 'Surcharge €/parcel': 4.89},
+])
+
+
+def heavy_rules_from_editor(edited_df):
+    rules = []
+    for _, row in edited_df.iterrows():
+        if not bool(row.get('Enabled', False)):
+            continue
+        try:
+            thr = float(row.get('Weight threshold kg'))
+        except (TypeError, ValueError):
+            continue
+        try:
+            sur = float(row.get('Surcharge €/parcel') or 0)
+        except (TypeError, ValueError):
+            sur = 0.0
+        carrier = str(row.get('Carrier', '') or '').strip()
+        country = str(row.get('Country (blank=all)', '') or '').strip().upper()
+        rules.append({
+            'enabled':        True,
+            'mode':           'threshold',
+            'label':          f'Heavy parcel {carrier or "ALL"} ≥{thr:g}kg',
+            'carriers':       [carrier] if carrier and carrier != '(all)' else [],
+            'countries':      [c.strip() for c in country.split(',') if c.strip()],
+            'constraint_col': 'EACH_WEIGHT',
+            'threshold':      thr,
+            'flag_col':       'AWKWARD',
+            'flag_value':     'y',
+            'surcharge':      sur,
+            'surcharge_mode': 'per_parcel',
+        })
+    return rules
+
+
 # ── Pallet MAUT editor helpers ────────────────────────────────────────────────
 
 def _default_pallet_maut_df():
@@ -579,6 +620,30 @@ with st.expander("📐 Exceptions & buckets — oversize / surcharges per carrie
         }, key='postcode_editor')
     st.session_state.postcode_df = pc_edit
 
+    st.markdown('---')
+    st.markdown("**Heavy / oversized parcel** — per-parcel **weight** surcharge. "
+                "Any row whose per-box cap (EACH_WEIGHT) reaches the threshold is "
+                "surcharged €/parcel × parcels, flagged (AWKWARD) and shown in amber. "
+                "It does **not** overwrite the weight grid. Default: DHL parcels "
+                "≥ 20 kg → €4.89/parcel. Note: a heavy parcel that is *also* over a "
+                "size limit is charged the size surcharge only (rare).")
+    if 'heavy_df' not in st.session_state:
+        st.session_state.heavy_df = DEFAULT_HEAVY.copy()
+    hv_edit = st.data_editor(
+        st.session_state.heavy_df, num_rows="dynamic",
+        use_container_width=True, hide_index=True,
+        column_config={
+            'Enabled': st.column_config.CheckboxColumn(width="small"),
+            'Carrier': st.column_config.SelectboxColumn(
+                options=['(all)'] + list(pl.CARRIER_DEFAULTS), width="small"),
+            'Country (blank=all)': st.column_config.TextColumn(width="small"),
+            'Weight threshold kg': st.column_config.NumberColumn(
+                format="%.1f", help="Surcharge rows whose per-box cap can hold a "
+                                    "parcel at/over this weight."),
+            'Surcharge €/parcel': st.column_config.NumberColumn(format="%.2f"),
+        }, key='heavy_editor')
+    st.session_state.heavy_df = hv_edit
+
 st.divider()
 
 # ── Run ────────────────────────────────────────────────────────────────────────
@@ -590,6 +655,8 @@ if run_btn and uploaded and selected:
     input_path = st.session_state['input_path']
     errors = {}
     rules    = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
+    hv_rules = heavy_rules_from_editor(st.session_state.get('heavy_df', DEFAULT_HEAVY))
+    rules    = rules + hv_rules   # heavy (threshold) rules evaluated after oversize (stamp)
     ov_rules = overflow_rules_from_editor(st.session_state.get('overflow_df', DEFAULT_OVERFLOW))
     pc_rules = postcode_rules_from_editor(st.session_state.get('postcode_df', DEFAULT_POSTCODE))
     pallets  = st.session_state.get('pallets')   # None if no pallet card uploaded
