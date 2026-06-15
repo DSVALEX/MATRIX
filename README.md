@@ -88,7 +88,7 @@ want a single file instead of many.
 
 Some rows are highlighted so you can spot them at a glance:
 
-- **Orange rows** = **pallet** shipments (DHL-FENDER freight). They're priced on
+- **Blue rows** = **pallet** shipments (DHL-FENDER freight). They're priced on
   a completely different basis from parcels, so the colour keeps the two modes
   visually separate in a mixed sheet.
 - **Pale amber rows** = **catch-all / bucket** rows — the safety-net rows for
