@@ -494,28 +494,28 @@ else:
     selectable = ALL_COUNTRIES
     st.caption("Choose which countries to generate matrices for.")
 
-if 'country_selection' not in st.session_state:
-    st.session_state.country_selection = {}
+# Checkbox state lives under the widget keys themselves (chk_<country>). The
+# Select all / Clear buttons render *before* the checkboxes, so they may seed
+# those keys directly; a keyed checkbox ignores `value=` on rerun and reads its
+# state from session_state, which is why writing to a separate dict did nothing.
 for c in selectable:
-    st.session_state.country_selection.setdefault(c, False)
+    st.session_state.setdefault(f'chk_{c}', False)
 
 ca, cb, *_ = st.columns([1, 1, 8])
 if ca.button("Select all"):
     for c in selectable:
-        st.session_state.country_selection[c] = True
+        st.session_state[f'chk_{c}'] = True
 if cb.button("Clear"):
     for c in selectable:
-        st.session_state.country_selection[c] = False
+        st.session_state[f'chk_{c}'] = False
 
 COLS = 10
 grid = st.columns(COLS)
 for i, country in enumerate(selectable):
     with grid[i % COLS]:
-        st.session_state.country_selection[country] = st.checkbox(
-            country, value=st.session_state.country_selection.get(country, False),
-            key=f'chk_{country}')
+        st.checkbox(country, key=f'chk_{country}')
 
-selected = [c for c in selectable if st.session_state.country_selection.get(c)]
+selected = [c for c in selectable if st.session_state.get(f'chk_{c}')]
 
 # ── Advanced per-country settings ─────────────────────────────────────────────
 if selected:
