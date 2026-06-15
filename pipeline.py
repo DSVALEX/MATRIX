@@ -765,7 +765,7 @@ def _common(site, client, carrier, iso2):
             'COUNTRYISO2': iso2, 'POSTCODE': None, 'MIN_WEIGHT': None,
             'MIN_VOLUME': None, 'MIN_PARCEL': None,
             'USER_DEF_TYPE_2': None,
-            'USER_DEF_TYPE_4 (max 1,5m)': None, 'AWKWARD': None, 'RATE_EXTRA': 0}
+            'USER_DEF_TYPE_4 (max 1,5m)': None, 'RATE_EXTRA': 0}
 
 
 def build_combined_weight_rows(c0, bands, max_parcel, service_level,
@@ -1093,7 +1093,7 @@ COLUMN_ORDER = [
     'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
     'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
     'USER_DEF_TYPE_2',
-    'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD', 'RATE_BASE', 'RATE_EXTRA',
+    'USER_DEF_TYPE_4 (max 1,5m)', 'RATE_BASE', 'RATE_EXTRA',
     'FUEL', 'MAUT', 'Linehaul UPSDE', 'TOTAL_PRICE',
 ]
 COL_LETTER = {name: openpyxl.utils.get_column_letter(i + 1)
@@ -1834,7 +1834,7 @@ PALLET_COLUMN_ORDER = [
     'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
     'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
     'FACTORED RATE PALLET', 'USER_DEF_TYPE_1', 'USER_DEF_TYPE_2',
-    'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD',
+    'USER_DEF_TYPE_4 (max 1,5m)',
     'RATE_BASE', 'RATE_EXTRA', 'MOBILITY', 'FUEL', 'MAUT', 'Linehaul UPSDE',
     'TOLL', 'ADMIN', 'TOTAL_PRICE',
 ]
@@ -1894,7 +1894,7 @@ def build_pallet_df(country, zip_rate_map, band_ceilings,
                 'EACH_WEIGHT': None, 'EACH_VOLUME': None,
                 'FACTORED RATE PALLET': rate_base,
                 'USER_DEF_TYPE_1': None, 'USER_DEF_TYPE_2': None,
-                'USER_DEF_TYPE_4 (max 1,5m)': None, 'AWKWARD': None,
+                'USER_DEF_TYPE_4 (max 1,5m)': None,
                 'RATE_BASE': rate_base, 'RATE_EXTRA': 0,
                 'MOBILITY': mob, 'FUEL': fuel, 'MAUT': maut,
                 'Linehaul UPSDE': None, 'TOLL': toll, 'ADMIN': admin,
@@ -1956,14 +1956,17 @@ def write_matrix_numeric(df, output_path, country_cfg, variables_layout=None,
     for ci, col in enumerate(order, 1):
         ws.cell(1, ci, col)
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
-    fill = PatternFill('solid', fgColor='FFF2CC')
+    fill        = PatternFill('solid', fgColor='FFF2CC')   # pale amber = catch-all bucket
+    pallet_fill = PatternFill('solid', fgColor='FFC000')   # orange = pallet (DHL-FENDER) row
     for ri, rec in enumerate(df_sorted.to_dict('records'), start=2):
         is_bucket = bool(rec.get('_is_bucket'))
+        is_pallet = (rec.get('CARRIER_ID') == 'DHL-FENDER')
+        row_fill  = pallet_fill if is_pallet else (fill if is_bucket else None)
         for ci, col in enumerate(order, 1):
             v = rec.get(col)
             cell = ws.cell(ri, ci, None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
-            if is_bucket:
-                cell.fill = fill
+            if row_fill is not None:
+                cell.fill = row_fill
     vs = wb.create_sheet('Variables')
     for ri, (name, val) in enumerate(vl, 1):
         vs.cell(ri, 1, name)
@@ -2073,7 +2076,8 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
         ws.cell(1, ci, col)
 
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
-    fill = PatternFill('solid', fgColor='FFF2CC')
+    fill        = PatternFill('solid', fgColor='FFF2CC')   # pale amber = catch-all bucket
+    pallet_fill = PatternFill('solid', fgColor='FFC000')   # orange = pallet (DHL-FENDER) row
 
     L_RATE  = L['RATE_BASE']
     L_EXTRA = L.get('RATE_EXTRA')
@@ -2146,7 +2150,9 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
             else:
                 v = rec.get(col)
                 cell = ws.cell(ri, ci, None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
-            if is_bucket:
+            if is_pallet:
+                cell.fill = pallet_fill
+            elif is_bucket:
                 cell.fill = fill
 
     # ── Variables sheet ──────────────────────────────────────────────────────
