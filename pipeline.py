@@ -1287,12 +1287,19 @@ def optimize_globally(input_path, output_path):
 # every constrained row needs a cheaper-to-build "bucket" twin lower down that
 # drops the limit, flags the row for oversight, and adds a surcharge.
 #
-# An exception rule is a plain dict (general — not size-specific):
+# An exception rule is a plain dict. Two modes:
+#
+# mode='stamp' (default) — for INERT constraint columns (size flags). Stamps a
+# normal limit on the cheap base rows and appends a bucket TWIN that drops the
+# limit, flags it, and adds a surcharge. Orders bigger than the limit fall
+# through to the twin.
 #   {
 #     'enabled':        True,
 #     'label':          'Oversize (max 1.5m)',
 #     'carriers':       ['UPDE'],      # scope; [] = all carriers
 #     'countries':      [],            # scope; [] = all countries
+#     'service_levels': [],            # scope; [] = all services
+#     'mode':           'stamp',       # (default)
 #     'constraint_col': 'USER_DEF_TYPE_4 (max 1,5m)',
 #     'normal_value':   1.5,           # stamped on the cheap base rows
 #     'bucket_value':   None,          # value on the bucket twin (None = catch-all)
@@ -1301,6 +1308,36 @@ def optimize_globally(input_path, output_path):
 #     'surcharge':      6.0,           # euros
 #     'surcharge_mode': 'per_parcel',  # 'per_parcel' (× MAX_PARCEL) or 'flat'
 #   }
+#
+# mode='threshold' — for COMPUTATIONAL constraint columns (e.g. EACH_WEIGHT,
+# which feeds MAX_WEIGHT/volumes and must NOT be overwritten). Does NOT stamp or
+# twin: it surcharges, in place, every in-scope BASE row whose constraint value
+# is >= threshold, flags it, and marks it as a bucket (amber). No twin is made
+# because an identical-constraint twin would never be matched (the matcher always
+# takes the cheaper original). Use for per-parcel weight surcharges such as
+# "DHL parcel >= 20 kg costs €4.89 per parcel more".
+#   {
+#     'enabled':        True,
+#     'label':          'Heavy parcel DHL >=20kg',
+#     'carriers':       ['DHL-ROS'],   # scope
+#     'countries':      [],            # scope
+#     'mode':           'threshold',
+#     'constraint_col': 'EACH_WEIGHT', # per-box cap (kg) — NOT overwritten
+#     'threshold':      20.0,          # surcharge rows whose cap can hold a >=20kg box
+#     'flag_col':       'AWKWARD',
+#     'flag_value':     'y',
+#     'surcharge':      4.89,          # euros
+#     'surcharge_mode': 'per_parcel',  # 'per_parcel' (× MAX_PARCEL) or 'flat'
+#   }
+#
+# NOTE: a heavy-parcel threshold and an oversize stamp do not stack on the same
+# shipment (the oversize twin does not inherit the heavy surcharge). This affects
+# only the rare parcel that is BOTH over the size limit AND >= the weight
+# threshold; the common heavy-but-normal-size parcel is surcharged correctly.
+# Because EACH_WEIGHT is a derived per-box cap (band_top / parcel_count), a row
+# whose cap is >= the threshold may also match an all-light shipment that happens
+# to fall in that band — such a shipment is over-charged, never under-charged
+# (the safe direction, consistent with the bucket philosophy).
 #
 # FUTURE BUCKET IDEAS (designed for, not yet implemented):
 #   • parcel-count overflow  — a row with MAX_PARCEL blank to catch >max parcels
@@ -1332,8 +1369,13 @@ def apply_exceptions(df, rules):
     df = df.copy().reset_index(drop=True)
     if '_is_bucket' not in df.columns:
         df['_is_bucket'] = False
+    # RATE_EXTRA may arrive as int64 (initialised to 0); coerce to float so the
+    # in-place threshold surcharge assignment cannot raise a dtype error.
+    if 'RATE_EXTRA' in df.columns:
+        df['RATE_EXTRA'] = pd.to_numeric(df['RATE_EXTRA'], errors='coerce').astype('float64')
 
     new_buckets = []
+    touched = False
     for rule in rules:
         if not rule.get('enabled', True):
             continue
@@ -1342,6 +1384,7 @@ def apply_exceptions(df, rules):
             log.warning("exception rule skipped — column '%s' not in matrix", ccol)
             continue
 
+        # in-scope BASE rows (buckets are never re-processed)
         scope = (~df['_is_bucket'])
         if rule.get('carriers'):
             scope &= df['CARRIER_ID'].isin(rule['carriers'])
@@ -1352,6 +1395,37 @@ def apply_exceptions(df, rules):
         if not scope.any():
             continue
 
+        sur        = float(rule.get('surcharge', 0) or 0)
+        per_parcel = rule.get('surcharge_mode', 'per_parcel') == 'per_parcel'
+        mode       = rule.get('mode', 'stamp')
+
+        if mode == 'threshold':
+            # Per-parcel weight/size THRESHOLD on a COMPUTATIONAL column.
+            # Do NOT overwrite ccol (it feeds MAX_WEIGHT/volumes). Surcharge the
+            # rows whose per-box cap can hold a parcel at/over the threshold,
+            # flag them, and mark them as buckets (amber). No twins.
+            try:
+                thr = float(rule['threshold'])
+            except (TypeError, ValueError, KeyError):
+                log.warning("threshold rule '%s' skipped — no valid 'threshold'",
+                            rule.get('label', ccol))
+                continue
+            col_num = pd.to_numeric(df[ccol], errors='coerce')
+            hit = scope & (col_num >= thr - 1e-9)
+            if not hit.any():
+                continue
+            if per_parcel:
+                add = sur * df.loc[hit, 'MAX_PARCEL'].fillna(1)
+            else:
+                add = sur
+            df.loc[hit, 'RATE_EXTRA'] = df.loc[hit, 'RATE_EXTRA'].fillna(0) + add
+            if rule.get('flag_col'):
+                df.loc[hit, rule['flag_col']] = rule.get('flag_value', 'y')
+            df.loc[hit, '_is_bucket'] = True
+            touched = True
+            continue
+
+        # ---- mode == 'stamp' (original behaviour) ----
         # 1) stamp the normal limit onto the cheap base rows
         df.loc[scope, ccol] = rule['normal_value']
 
@@ -1360,16 +1434,17 @@ def apply_exceptions(df, rules):
         twins[ccol] = rule.get('bucket_value', None)
         if rule.get('flag_col'):
             twins[rule['flag_col']] = rule.get('flag_value', 'y')
-        sur = float(rule.get('surcharge', 0) or 0)
-        if rule.get('surcharge_mode', 'per_parcel') == 'per_parcel':
+        if per_parcel:
             twins['RATE_EXTRA'] = twins['RATE_EXTRA'].fillna(0) + sur * twins['MAX_PARCEL']
         else:
             twins['RATE_EXTRA'] = twins['RATE_EXTRA'].fillna(0) + sur
         twins['_is_bucket'] = True
         new_buckets.append(twins)
+        touched = True
 
     if new_buckets:
         df = pd.concat([df] + new_buckets, ignore_index=True)
+    if touched:
         df = _recompute_total(df)
     return df
 
