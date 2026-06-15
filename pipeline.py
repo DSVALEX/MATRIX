@@ -2077,7 +2077,7 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
 
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
     fill        = PatternFill('solid', fgColor='FFF2CC')   # pale amber = catch-all bucket
-    pallet_fill = PatternFill('solid', fgColor='FFC000')   # orange = pallet (DHL-FENDER) row
+    pallet_fill = PatternFill('solid', fgColor='0070C0')   # orange = pallet (DHL-FENDER) row
 
     L_RATE  = L['RATE_BASE']
     L_EXTRA = L.get('RATE_EXTRA')
