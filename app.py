@@ -28,7 +28,7 @@ import pipeline as pl
 import master_parser as mp
 import pallet_parser as pp
 
-st.set_page_config(page_title="Rate Matrix Builder", page_icon="📦",
+st.set_page_config(page_title="Rate Matrix Builder", page_icon="",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -341,7 +341,7 @@ def make_combined(results, variables_layout_rows, stage='minimal',
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 📦 Rate Matrix Builder")
+    st.markdown("##  Rate Matrix Builder")
     st.caption("Fender Musical Instruments · Logistics")
     st.divider()
 
@@ -478,7 +478,7 @@ with st.sidebar:
     st.divider()
     run_btn = st.button("▶ Generate matrices", type="primary",
                         use_container_width=True, disabled=(uploaded is None))
-    exp_btn = st.button("⚡ Express-only matrices",
+    exp_btn = st.button("▶ Express-only matrices",
                         use_container_width=True, disabled=(uploaded is None),
                         help="Build a matrix with ONLY the EXPRESS SAVER options — "
                              "UPS DE (7R9W62 + EXPRESS SAVER), UPS NL EXPRESS SAVER, "
