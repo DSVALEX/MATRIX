@@ -731,6 +731,19 @@ def _upde_service_buckets(rate_data, service_key, country_cfg):
             return by_zone.get(zid, [])
         return by_zone.get(zid) or flat
 
+    # Alphanumeric-postcode countries (UK): zones are keyed by outward-code AREA
+    # (AB, BT, WC, …) instead of numeric prefixes. Emit one bucket per area so
+    # each carries its true zone — Express Saver mainland z3 vs BT (N. Ireland)
+    # z4 vs Channel Islands (GY/JE) z5. These deliberately do NOT collapse to a
+    # blank country-wide bucket: a cheaper blank row would capture the dearer
+    # BT/CI postcodes under CargoWrite cheapest-first matching and underprice
+    # them. Areas whose value for this service is "On Request" (HS/ZE Standard)
+    # simply have no zone key here and are skipped.
+    if any(z.get('pc_prefix') for z in zones):
+        return [(z['pc_prefix'], tiers_for(z[service_key]))
+                for z in zones
+                if service_key in z and tiers_for(z[service_key])]
+
     # If zones carry no pc_from/pc_to (old-style single-zone entry), treat as flat
     has_pc_ranges = any('pc_from' in z and 'pc_to' in z for z in zones)
     if not has_pc_ranges or len(unique_zones) == 1:
@@ -1162,24 +1175,31 @@ def write_matrix_excel(df, output_path, country_cfg,
 # ==============================================================================
 
 def optimize_matrix(df):
-    df = df.copy()
-    df['_origrow'] = df.index
-    keep_mask = pd.Series(True, index=df.index)
-    df_filled = df.copy()
-    df_filled['POSTCODE_KEY'] = (df_filled['POSTCODE'].fillna(-1)
-                                 .infer_objects(copy=False))
-    for _, grp in df_filled.groupby(['CARRIER_ID', 'SERVICE_LEVEL', 'POSTCODE_KEY']):
-        grp = grp.sort_values('TOTAL_PRICE', kind='stable').reset_index()
-        for i in range(len(grp)):
-            r       = grp.iloc[i]
-            earlier = grp.iloc[:i]
-            dom = ((earlier['MAX_WEIGHT']  >= r['MAX_WEIGHT']) &
-                   (earlier['MAX_PARCEL']  >= r['MAX_PARCEL']) &
-                   (earlier['EACH_WEIGHT'] >= r['EACH_WEIGHT']))
-            if dom.any():
-                keep_mask.loc[r['_origrow']] = False
-    log.info('first-pass: removed %d dominated rows', (~keep_mask).sum())
-    return df[keep_mask].drop(columns=['_origrow']).reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    if df.empty:
+        return df
+    # str key so numeric / UK-alpha / blank postcodes share a group cleanly.
+    pk = df['POSTCODE'].fillna('').astype(str).values
+    car = df['CARRIER_ID'].values
+    svc = df['SERVICE_LEVEL'].values
+    w = df['MAX_WEIGHT'].values.astype(float)
+    p = df['MAX_PARCEL'].values.astype(float)
+    e = df['EACH_WEIGHT'].values.astype(float)
+    price = df['TOTAL_PRICE'].values.astype(float)
+    groups = {}
+    for idx in range(len(df)):
+        groups.setdefault((car[idx], svc[idx], pk[idx]), []).append(idx)
+    drop = set()
+    for idxs in groups.values():
+        idxs = sorted(idxs, key=lambda k: price[k])     # cheapest first
+        for a in range(1, len(idxs)):
+            i = idxs[a]
+            ear = np.asarray(idxs[:a])
+            if ((w[ear] >= w[i]) & (p[ear] >= p[i]) & (e[ear] >= e[i])).any():
+                drop.add(i)
+    keep = [i for i in range(len(df)) if i not in drop]
+    log.info('first-pass: removed %d dominated rows', len(drop))
+    return df.iloc[keep].reset_index(drop=True)
 
 
 # ==============================================================================
@@ -1261,14 +1281,31 @@ def optimize_globally(input_path, output_path):
     w  = df_s['MAX_WEIGHT'].values.astype(float)
     p  = df_s['MAX_PARCEL'].values.astype(float)
     e  = df_s['EACH_WEIGHT'].values.astype(float)
-    pc = df_s['POSTCODE'].values.astype(float)
-    pc_nan = np.isnan(pc)
+    pc = df_s['POSTCODE'].values                 # object: int / str (UK) / None
+    pc_blank = pd.isna(pc)
     orig   = df_s['_orig'].values
+    n = len(df_s)
     dominated = set()
-    for i in range(1, len(df_s)):
-        pc_compat = pc_nan[:i] if pc_nan[i] else (pc_nan[:i] | (pc[:i] == pc[i]))
-        if (pc_compat & (w[:i] >= w[i]) & (p[:i] >= p[i]) & (e[:i] >= e[i])).any():
-            dominated.add(int(orig[i]))
+    blank_idx = np.where(pc_blank)[0]
+
+    def _mark(idxs, skip_blank):
+        idxs = np.asarray(idxs)
+        for a in range(1, len(idxs)):
+            i = idxs[a]
+            if skip_blank and pc_blank[i]:
+                continue
+            ear = idxs[:a]
+            if ((w[ear] >= w[i]) & (p[ear] >= p[i]) & (e[ear] >= e[i])).any():
+                dominated.add(int(orig[i]))
+
+    _mark(blank_idx, skip_blank=False)
+    groups = {}
+    for j in range(n):
+        if not pc_blank[j]:
+            groups.setdefault(pc[j], []).append(j)
+    blank_list = blank_idx.tolist()
+    for idxs in groups.values():
+        _mark(sorted(blank_list + idxs), skip_blank=True)
     keep = set(df.index) - dominated
     n = _write_filtered_excel(input_path, output_path, keep)
     log.info('global optimizer: %d → %d rows (%d removed)', len(df), n, len(dominated))
@@ -1580,14 +1617,40 @@ def optimize_globally_df(df):
     w  = df_s['MAX_WEIGHT'].values.astype(float)
     p  = df_s['MAX_PARCEL'].values.astype(float)
     e  = df_s['EACH_WEIGHT'].values.astype(float)
-    pc = df_s['POSTCODE'].values.astype(float)
-    pc_nan = np.isnan(pc)
+    pc = df_s['POSTCODE'].values                 # object: int / str (UK) / None
+    pc_blank = pd.isna(pc)
     orig = df_s['_orig'].values
+    n = len(df_s)
     dominated = set()
-    for i in range(1, len(df_s)):
-        pc_compat = pc_nan[:i] if pc_nan[i] else (pc_nan[:i] | (pc[:i] == pc[i]))
-        if (pc_compat & (w[:i] >= w[i]) & (p[:i] >= p[i]) & (e[:i] >= e[i])).any():
-            dominated.add(int(orig[i]))
+
+    # Postcode-partitioned dominance. A blank (country-wide) row can dominate
+    # anything; a specific-postcode row can only be dominated by a blank row or
+    # another row with the SAME postcode. Two different specific postcodes are
+    # always incompatible, so comparing them is wasted work. Scanning blank rows
+    # once, then each postcode group against (blank + itself), turns the whole-
+    # matrix O(n^2) into the sum of small per-postcode scans — essential once GB
+    # carries ~124 UK outward-code areas (was a multi-minute hang otherwise).
+    blank_idx = np.where(pc_blank)[0]
+
+    def _mark(idxs, skip_blank):
+        idxs = np.asarray(idxs)
+        for a in range(1, len(idxs)):
+            i = idxs[a]
+            if skip_blank and pc_blank[i]:
+                continue
+            ear = idxs[:a]                       # cheaper-or-equal candidates
+            if ((w[ear] >= w[i]) & (p[ear] >= p[i]) & (e[ear] >= e[i])).any():
+                dominated.add(int(orig[i]))
+
+    _mark(blank_idx, skip_blank=False)           # blank rows: only blanks dominate
+    groups = {}
+    for j in range(n):
+        if not pc_blank[j]:
+            groups.setdefault(pc[j], []).append(j)
+    blank_list = blank_idx.tolist()
+    for idxs in groups.values():
+        merged = sorted(blank_list + idxs)       # ascending price (df_s is sorted)
+        _mark(merged, skip_blank=True)           # only mark the specific rows
     keep = [i for i in range(len(df)) if i not in dominated]
     return df.iloc[keep].reset_index(drop=True)
 
