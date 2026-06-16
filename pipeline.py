@@ -1152,8 +1152,11 @@ def write_matrix_excel(df, output_path, country_cfg,
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
     bucket_fill = PatternFill('solid', fgColor='FFF2CC')   # soft amber = catch-all bucket
     for ri, row_dict in enumerate(df_sorted.to_dict('records'), start=2):
-        formulas = _build_formulas_for_row(row_dict, ri, carrier_defaults)
         is_bucket = bool(row_dict.get('_is_bucket'))
+        # A sentinel catch-all (bucket with no rate components) keeps its literal
+        # TOTAL_PRICE; building a formula would sum blanks to 0.
+        sentinel = is_bucket and pd.isna(row_dict.get('RATE_BASE'))
+        formulas = {} if sentinel else _build_formulas_for_row(row_dict, ri, carrier_defaults)
         for ci, col in enumerate(COLUMN_ORDER, 1):
             if col in formulas:
                 cell = ws.cell(ri, ci, formulas[col])
@@ -1694,6 +1697,51 @@ def run_pipeline(input_path, country, output_dir='.',
                                     pallet_max_band_kg=pallet_max_band_kg)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Last-resort EUROCONNECT catch-all bucket
+# One per country, appended at the very end of the generated matrix. It matches
+# any pallet order up to the cap and is priced absurdly high, so CargoWrite never
+# leaves an order unmatched — the sentinel price guarantees it is only chosen when
+# nothing cheaper fits. Components are blank, so the writers render it as a literal
+# price (not a formula).
+EUROCONNECT_BUCKET_MAX_WEIGHT = 24000.0          # kg ceiling
+EUROCONNECT_BUCKET_DENSITY    = 330.0            # kg/m³ → MAX_VOLUME = weight / density
+EUROCONNECT_BUCKET_PRICE      = 999999.0         # sentinel last-resort price (EUR)
+
+
+def append_euroconnect_buckets(df, site_id='NLMOE01', client_id='NLFENDER'):
+    """Append one DHL-FENDER / EUROCONNECT catch-all row per country in `df`."""
+    if df is None or df.empty:
+        return df
+    countries = list(dict.fromkeys(df['COUNTRYISO2'].dropna()))
+    if not countries:
+        return df
+    if 'SITE_ID' in df.columns and df['SITE_ID'].notna().any():
+        site_id = df['SITE_ID'].dropna().iloc[0]
+    if 'CLIENT_ID' in df.columns and df['CLIENT_ID'].notna().any():
+        client_id = df['CLIENT_ID'].dropna().iloc[0]
+    max_vol = round(EUROCONNECT_BUCKET_MAX_WEIGHT / EUROCONNECT_BUCKET_DENSITY, 8)
+    rows = []
+    for iso in countries:
+        row = {c: None for c in df.columns}
+        row.update({
+            'SITE_ID': site_id, 'CLIENT_ID': client_id,
+            'CARRIER_ID': 'DHL-FENDER', 'SERVICE_LEVEL': 'EUROCONNECT',
+            'COUNTRYISO2': iso,
+            'MAX_WEIGHT': EUROCONNECT_BUCKET_MAX_WEIGHT,
+            'MAX_VOLUME': max_vol,
+            'TOTAL_PRICE': EUROCONNECT_BUCKET_PRICE,
+        })
+        if '_is_bucket' in df.columns:
+            row['_is_bucket'] = True
+        rows.append(row)
+    bucket_df = pd.DataFrame(rows, columns=df.columns)
+    if '_is_bucket' not in df.columns:
+        df = df.copy(); df['_is_bucket'] = False
+        bucket_df['_is_bucket'] = True
+    return pd.concat([df, bucket_df], ignore_index=True)
+
+
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
                              carrier_defaults=None, variables_layout=None,
                              exceptions=None, overflow_rules=None,
@@ -1785,12 +1833,18 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         df_min = optimize_globally_df(df_opt) if not df_opt.empty else pd.DataFrame()
         df_ext_final, df_opt_final, df_min_final = df, df_opt, df_min
 
+    add_buckets = not express_only   # express-only builds are parcel-only
+
     if has_pallet:
         # Merge pallet rows into each stage (pallet rows never dominate parcel
         # rows and vice-versa — different shipment profiles), write with formulas.
         ext_all = _align_columns([df_ext_final, df_pal_ext])
         opt_all = _align_columns([df_opt_final, df_pal_opt])
         min_all = _align_columns([df_min_final, df_pal_opt])
+        if add_buckets:
+            ext_all = append_euroconnect_buckets(ext_all)
+            opt_all = append_euroconnect_buckets(opt_all)
+            min_all = append_euroconnect_buckets(min_all)
         write_matrix_with_formulas(ext_all, ext_path, cfg, cd, vl, pallet_maut,
                                    pallet_defaults)
         write_matrix_with_formulas(opt_all, opt_path, cfg, cd, vl, pallet_maut,
@@ -1800,6 +1854,10 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         rows_ext, rows_opt, rows_min = len(ext_all), len(opt_all), len(min_all)
         extended_frame, optimized_frame, minimal_frame = ext_all, opt_all, min_all
     elif any_buckets:
+        if add_buckets:
+            df_ext_final = append_euroconnect_buckets(df_ext_final)
+            df_opt_final = append_euroconnect_buckets(df_opt_final)
+            df_min_final = append_euroconnect_buckets(df_min_final)
         write_matrix_excel(df_ext_final, ext_path, cfg, cd, vl)
         write_matrix_excel(df_opt_final, opt_path, cfg, cd, vl)
         write_matrix_excel(df_min_final, min_path, cfg, cd, vl)
@@ -1808,6 +1866,9 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         extended_frame, optimized_frame = df_ext_final, df_opt_final
         minimal_frame = df_min_final
     else:
+        if add_buckets:
+            df     = append_euroconnect_buckets(df)
+            df_opt = append_euroconnect_buckets(df_opt)
         write_matrix_excel(df, ext_path, cfg, cd, vl)
         write_matrix_excel(df_opt, opt_path, cfg, cd, vl)
         stats = optimize_globally(opt_path, min_path)
@@ -2169,9 +2230,13 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
         carrier   = rec.get('CARRIER_ID')
         is_bucket = bool(rec.get('_is_bucket'))
         is_pallet = (carrier == 'DHL-FENDER')
+        # Sentinel catch-all bucket (no rate components): keep its literal price.
+        sentinel = is_bucket and pd.isna(rec.get('RATE_BASE'))
         formulas = {}
 
-        if is_pallet:
+        if sentinel:
+            pass
+        elif is_pallet:
             iso = rec.get('COUNTRYISO2')
             formulas['FUEL']     = f"=Variables!$B${r_fuel}*{L_RATE}{ri}"
             formulas['MOBILITY'] = f"=Variables!$B${r_mob}*{L_RATE}{ri}"
