@@ -152,6 +152,7 @@ def _parse_upsde_zones(ws):
         # every country whose zone row says 'ALL' (~210 countries) gets dropped.
         pc_from_raw = ws.cell(r, from_col).value
         pc_to_raw   = ws.cell(r, to_col).value
+        pc_prefix = None
         if isinstance(pc_from_raw, str) and pc_from_raw.strip().upper() == 'ALL':
             pc_from, pc_to = 0, 99999
         else:
@@ -159,15 +160,26 @@ def _parse_upsde_zones(ws):
                 pc_from = int(str(pc_from_raw))
                 pc_to   = int(str(pc_to_raw))
             except (TypeError, ValueError):
-                continue
+                # Alphanumeric postcode AREA (UK outward codes: AB, BT, WC, …).
+                # These used to be dropped via `continue`, silently losing the
+                # ENTIRE GB tariff (same failure mode as the old 'ALL' bug).
+                # Keep the area string as a prefix; numeric pc range is N/A.
+                if isinstance(pc_from_raw, str) and pc_from_raw.strip():
+                    pc_prefix = pc_from_raw.strip().upper()
+                    pc_from = pc_to = None
+                else:
+                    continue
         entry = {'pc_from': pc_from, 'pc_to': pc_to}
+        if pc_prefix is not None:
+            entry['pc_prefix'] = pc_prefix
+        n_zone = 0
         for svc, col in svc_cols.items():
             v = ws.cell(r, col).value
             if isinstance(v, (int, float)):
-                entry[svc] = int(v)
+                entry[svc] = int(v); n_zone += 1
             elif isinstance(v, str) and v.strip() and pl._norm(v) != 'on request':
-                entry[svc] = v.strip()
-        if len(entry) > 2:  # at least one zone assignment beyond pc_from/pc_to
+                entry[svc] = v.strip(); n_zone += 1
+        if n_zone:  # keep only rows with at least one real zone assignment
             out.setdefault(last_iso, []).append(entry)
     return out
 
