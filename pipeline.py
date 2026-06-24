@@ -731,6 +731,19 @@ def _upde_service_buckets(rate_data, service_key, country_cfg):
             return by_zone.get(zid, [])
         return by_zone.get(zid) or flat
 
+    # Alphanumeric-postcode countries (UK): zones are keyed by outward-code AREA
+    # (AB, BT, WC, …) instead of numeric prefixes. Emit one bucket per area so
+    # each carries its true zone — Express Saver mainland z3 vs BT (N. Ireland)
+    # z4 vs Channel Islands (GY/JE) z5. These deliberately do NOT collapse to a
+    # blank country-wide bucket: a cheaper blank row would capture the dearer
+    # BT/CI postcodes under CargoWrite cheapest-first matching and underprice
+    # them. Areas whose value for this service is "On Request" (HS/ZE Standard)
+    # simply have no zone key here and are skipped.
+    if any(z.get('pc_prefix') for z in zones):
+        return [(z['pc_prefix'], tiers_for(z[service_key]))
+                for z in zones
+                if service_key in z and tiers_for(z[service_key])]
+
     # If zones carry no pc_from/pc_to (old-style single-zone entry), treat as flat
     has_pc_ranges = any('pc_from' in z and 'pc_to' in z for z in zones)
     if not has_pc_ranges or len(unique_zones) == 1:
@@ -765,7 +778,7 @@ def _common(site, client, carrier, iso2):
             'COUNTRYISO2': iso2, 'POSTCODE': None, 'MIN_WEIGHT': None,
             'MIN_VOLUME': None, 'MIN_PARCEL': None,
             'USER_DEF_TYPE_2': None,
-            'USER_DEF_TYPE_4 (max 1,5m)': None, 'RATE_EXTRA': 0}
+            'USER_DEF_TYPE_4 (max 1,5m)': None, 'AWKWARD': None, 'RATE_EXTRA': 0}
 
 
 def build_combined_weight_rows(c0, bands, max_parcel, service_level,
@@ -1093,7 +1106,7 @@ COLUMN_ORDER = [
     'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
     'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
     'USER_DEF_TYPE_2',
-    'USER_DEF_TYPE_4 (max 1,5m)', 'RATE_BASE', 'RATE_EXTRA',
+    'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD', 'RATE_BASE', 'RATE_EXTRA',
     'FUEL', 'MAUT', 'Linehaul UPSDE', 'TOTAL_PRICE',
 ]
 COL_LETTER = {name: openpyxl.utils.get_column_letter(i + 1)
@@ -1139,8 +1152,11 @@ def write_matrix_excel(df, output_path, country_cfg,
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
     bucket_fill = PatternFill('solid', fgColor='FFF2CC')   # soft amber = catch-all bucket
     for ri, row_dict in enumerate(df_sorted.to_dict('records'), start=2):
-        formulas = _build_formulas_for_row(row_dict, ri, carrier_defaults)
         is_bucket = bool(row_dict.get('_is_bucket'))
+        # A sentinel catch-all (bucket with no rate components) keeps its literal
+        # TOTAL_PRICE; building a formula would sum blanks to 0.
+        sentinel = is_bucket and pd.isna(row_dict.get('RATE_BASE'))
+        formulas = {} if sentinel else _build_formulas_for_row(row_dict, ri, carrier_defaults)
         for ci, col in enumerate(COLUMN_ORDER, 1):
             if col in formulas:
                 cell = ws.cell(ri, ci, formulas[col])
@@ -1162,24 +1178,31 @@ def write_matrix_excel(df, output_path, country_cfg,
 # ==============================================================================
 
 def optimize_matrix(df):
-    df = df.copy()
-    df['_origrow'] = df.index
-    keep_mask = pd.Series(True, index=df.index)
-    df_filled = df.copy()
-    df_filled['POSTCODE_KEY'] = (df_filled['POSTCODE'].fillna(-1)
-                                 .infer_objects(copy=False))
-    for _, grp in df_filled.groupby(['CARRIER_ID', 'SERVICE_LEVEL', 'POSTCODE_KEY']):
-        grp = grp.sort_values('TOTAL_PRICE', kind='stable').reset_index()
-        for i in range(len(grp)):
-            r       = grp.iloc[i]
-            earlier = grp.iloc[:i]
-            dom = ((earlier['MAX_WEIGHT']  >= r['MAX_WEIGHT']) &
-                   (earlier['MAX_PARCEL']  >= r['MAX_PARCEL']) &
-                   (earlier['EACH_WEIGHT'] >= r['EACH_WEIGHT']))
-            if dom.any():
-                keep_mask.loc[r['_origrow']] = False
-    log.info('first-pass: removed %d dominated rows', (~keep_mask).sum())
-    return df[keep_mask].drop(columns=['_origrow']).reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    if df.empty:
+        return df
+    # str key so numeric / UK-alpha / blank postcodes share a group cleanly.
+    pk = df['POSTCODE'].fillna('').astype(str).values
+    car = df['CARRIER_ID'].values
+    svc = df['SERVICE_LEVEL'].values
+    w = df['MAX_WEIGHT'].values.astype(float)
+    p = df['MAX_PARCEL'].values.astype(float)
+    e = df['EACH_WEIGHT'].values.astype(float)
+    price = df['TOTAL_PRICE'].values.astype(float)
+    groups = {}
+    for idx in range(len(df)):
+        groups.setdefault((car[idx], svc[idx], pk[idx]), []).append(idx)
+    drop = set()
+    for idxs in groups.values():
+        idxs = sorted(idxs, key=lambda k: price[k])     # cheapest first
+        for a in range(1, len(idxs)):
+            i = idxs[a]
+            ear = np.asarray(idxs[:a])
+            if ((w[ear] >= w[i]) & (p[ear] >= p[i]) & (e[ear] >= e[i])).any():
+                drop.add(i)
+    keep = [i for i in range(len(df)) if i not in drop]
+    log.info('first-pass: removed %d dominated rows', len(drop))
+    return df.iloc[keep].reset_index(drop=True)
 
 
 # ==============================================================================
@@ -1261,14 +1284,31 @@ def optimize_globally(input_path, output_path):
     w  = df_s['MAX_WEIGHT'].values.astype(float)
     p  = df_s['MAX_PARCEL'].values.astype(float)
     e  = df_s['EACH_WEIGHT'].values.astype(float)
-    pc = df_s['POSTCODE'].values.astype(float)
-    pc_nan = np.isnan(pc)
+    pc = df_s['POSTCODE'].values                 # object: int / str (UK) / None
+    pc_blank = pd.isna(pc)
     orig   = df_s['_orig'].values
+    n = len(df_s)
     dominated = set()
-    for i in range(1, len(df_s)):
-        pc_compat = pc_nan[:i] if pc_nan[i] else (pc_nan[:i] | (pc[:i] == pc[i]))
-        if (pc_compat & (w[:i] >= w[i]) & (p[:i] >= p[i]) & (e[:i] >= e[i])).any():
-            dominated.add(int(orig[i]))
+    blank_idx = np.where(pc_blank)[0]
+
+    def _mark(idxs, skip_blank):
+        idxs = np.asarray(idxs)
+        for a in range(1, len(idxs)):
+            i = idxs[a]
+            if skip_blank and pc_blank[i]:
+                continue
+            ear = idxs[:a]
+            if ((w[ear] >= w[i]) & (p[ear] >= p[i]) & (e[ear] >= e[i])).any():
+                dominated.add(int(orig[i]))
+
+    _mark(blank_idx, skip_blank=False)
+    groups = {}
+    for j in range(n):
+        if not pc_blank[j]:
+            groups.setdefault(pc[j], []).append(j)
+    blank_list = blank_idx.tolist()
+    for idxs in groups.values():
+        _mark(sorted(blank_list + idxs), skip_blank=True)
     keep = set(df.index) - dominated
     n = _write_filtered_excel(input_path, output_path, keep)
     log.info('global optimizer: %d → %d rows (%d removed)', len(df), n, len(dominated))
@@ -1580,16 +1620,85 @@ def optimize_globally_df(df):
     w  = df_s['MAX_WEIGHT'].values.astype(float)
     p  = df_s['MAX_PARCEL'].values.astype(float)
     e  = df_s['EACH_WEIGHT'].values.astype(float)
-    pc = df_s['POSTCODE'].values.astype(float)
-    pc_nan = np.isnan(pc)
+    pc = df_s['POSTCODE'].values                 # object: int / str (UK) / None
+    pc_blank = pd.isna(pc)
     orig = df_s['_orig'].values
+    n = len(df_s)
     dominated = set()
-    for i in range(1, len(df_s)):
-        pc_compat = pc_nan[:i] if pc_nan[i] else (pc_nan[:i] | (pc[:i] == pc[i]))
-        if (pc_compat & (w[:i] >= w[i]) & (p[:i] >= p[i]) & (e[:i] >= e[i])).any():
-            dominated.add(int(orig[i]))
+
+    # Postcode-partitioned dominance. A blank (country-wide) row can dominate
+    # anything; a specific-postcode row can only be dominated by a blank row or
+    # another row with the SAME postcode. Two different specific postcodes are
+    # always incompatible, so comparing them is wasted work. Scanning blank rows
+    # once, then each postcode group against (blank + itself), turns the whole-
+    # matrix O(n^2) into the sum of small per-postcode scans — essential once GB
+    # carries ~124 UK outward-code areas (was a multi-minute hang otherwise).
+    blank_idx = np.where(pc_blank)[0]
+
+    def _mark(idxs, skip_blank):
+        idxs = np.asarray(idxs)
+        for a in range(1, len(idxs)):
+            i = idxs[a]
+            if skip_blank and pc_blank[i]:
+                continue
+            ear = idxs[:a]                       # cheaper-or-equal candidates
+            if ((w[ear] >= w[i]) & (p[ear] >= p[i]) & (e[ear] >= e[i])).any():
+                dominated.add(int(orig[i]))
+
+    _mark(blank_idx, skip_blank=False)           # blank rows: only blanks dominate
+    groups = {}
+    for j in range(n):
+        if not pc_blank[j]:
+            groups.setdefault(pc[j], []).append(j)
+    blank_list = blank_idx.tolist()
+    for idxs in groups.values():
+        merged = sorted(blank_list + idxs)       # ascending price (df_s is sorted)
+        _mark(merged, skip_blank=True)           # only mark the specific rows
     keep = [i for i in range(len(df)) if i not in dominated]
     return df.iloc[keep].reset_index(drop=True)
+
+
+# ==============================================================================
+# 9c. PARCEL POSTCODE EXPANSION
+# ==============================================================================
+#
+# CargoWrite skips a parcel row that has no POSTCODE when the order being priced
+# carries one — so every parcel row must ship with an explicit postcode for its
+# country. Pallet (DHL-FENDER) rows already carry their per-zip postcode and are
+# left untouched; parcel rows that already carry a specific postcode (zoned UPDE
+# / UPSNL buckets) are also left as-is. Only the BLANK-postcode parcel rows are
+# replicated, once per country postcode prefix.
+#
+# The postcode list is the country's set of prefixes from the DHL pallet file
+# (the de-facto per-country list: numeric prefixes as text with leading zeros,
+# e.g. '01','08','00'; Ireland uses named regions: DUBLIN, CORK, BT, …). Codes
+# stay as text so '01' never collapses to 1.
+
+def explode_parcel_postcodes(df, postcodes):
+    """Replicate each blank-POSTCODE parcel row once per postcode prefix.
+
+    Returns (df_out, n_base) where n_base is the number of blank parcel rows that
+    were exploded. If `postcodes` is empty but blank parcel rows exist, returns
+    the frame unchanged with n_base = -1 (caller should warn — the country has no
+    postcode list, e.g. LI / SM, and its parcel rows will stay blank).
+    """
+    if df is None or df.empty:
+        return df, 0
+    codes = [str(p).strip() for p in (postcodes or []) if str(p).strip() != '']
+    is_parcel = df['CARRIER_ID'].astype(str) != 'DHL-FENDER'
+    pc = df['POSTCODE']
+    blank = pc.isna() | (pc.astype(str).str.strip().isin(['', 'None', 'nan']))
+    target = is_parcel & blank
+    if not target.any():
+        return df, 0
+    if not codes:
+        return df, -1
+    keep = df[~target].copy()
+    base = df[target].copy().reset_index(drop=True)
+    rep = base.loc[base.index.repeat(len(codes))].copy()
+    rep['POSTCODE'] = codes * len(base)
+    out = pd.concat([keep, rep], ignore_index=True)
+    return out, len(base)
 
 
 # ==============================================================================
@@ -1631,13 +1740,59 @@ def run_pipeline(input_path, country, output_dir='.',
                                     pallet_max_band_kg=pallet_max_band_kg)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Last-resort EUROCONNECT catch-all bucket
+# One per country, appended at the very end of the generated matrix. It matches
+# any pallet order up to the cap and is priced absurdly high, so CargoWrite never
+# leaves an order unmatched — the sentinel price guarantees it is only chosen when
+# nothing cheaper fits. Components are blank, so the writers render it as a literal
+# price (not a formula).
+EUROCONNECT_BUCKET_MAX_WEIGHT = 24000.0          # kg ceiling
+EUROCONNECT_BUCKET_DENSITY    = 330.0            # kg/m³ → MAX_VOLUME = weight / density
+EUROCONNECT_BUCKET_PRICE      = 999999.0         # sentinel last-resort price (EUR)
+
+
+def append_euroconnect_buckets(df, site_id='NLMOE01', client_id='NLFENDER'):
+    """Append one DHL-FENDER / EUROCONNECT catch-all row per country in `df`."""
+    if df is None or df.empty:
+        return df
+    countries = list(dict.fromkeys(df['COUNTRYISO2'].dropna()))
+    if not countries:
+        return df
+    if 'SITE_ID' in df.columns and df['SITE_ID'].notna().any():
+        site_id = df['SITE_ID'].dropna().iloc[0]
+    if 'CLIENT_ID' in df.columns and df['CLIENT_ID'].notna().any():
+        client_id = df['CLIENT_ID'].dropna().iloc[0]
+    max_vol = round(EUROCONNECT_BUCKET_MAX_WEIGHT / EUROCONNECT_BUCKET_DENSITY, 8)
+    rows = []
+    for iso in countries:
+        row = {c: None for c in df.columns}
+        row.update({
+            'SITE_ID': site_id, 'CLIENT_ID': client_id,
+            'CARRIER_ID': 'DHL-FENDER', 'SERVICE_LEVEL': 'EUROCONNECT',
+            'COUNTRYISO2': iso,
+            'MAX_WEIGHT': EUROCONNECT_BUCKET_MAX_WEIGHT,
+            'MAX_VOLUME': max_vol,
+            'TOTAL_PRICE': EUROCONNECT_BUCKET_PRICE,
+        })
+        if '_is_bucket' in df.columns:
+            row['_is_bucket'] = True
+        rows.append(row)
+    bucket_df = pd.DataFrame(rows, columns=df.columns)
+    if '_is_bucket' not in df.columns:
+        df = df.copy(); df['_is_bucket'] = False
+        bucket_df['_is_bucket'] = True
+    return pd.concat([df, bucket_df], ignore_index=True)
+
+
 def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
                              carrier_defaults=None, variables_layout=None,
                              exceptions=None, overflow_rules=None,
                              postcode_rules=None,
                              pallet_zones=None, pallet_defaults=None,
                              pallet_overrides=None, pallet_maut=None,
-                             pallet_max_band_kg=None):
+                             pallet_max_band_kg=None, express_only=False,
+                             parcel_postcodes=None):
     """Build/optimize/write from an already-parsed rate dict.
     Used by the master-file path so the (expensive) parse happens only once.
 
@@ -1658,6 +1813,19 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
     log.info('raw parcel rows: %d', len(df))
     if not df.empty:
         df = compute_numeric_totals(df, cd)
+
+    # ── Express-only mode ─────────────────────────────────────────────────────
+    # Keep only the EXPRESS SAVER service rows: UPDE 'EXPRESS SAVER 7R9W62' and
+    # 'EXPRESS SAVER', UPSNL 'EXPRESS SAVER', UPSGB 'EXPRESS SAVER'. Drops
+    # STANDARD / PARCEL / WORLDEASE and switches pallets off (express is
+    # parcel-only). The substring match catches both UPDE express variants.
+    if express_only:
+        pallet_zones = None
+        if not df.empty:
+            keep = df['SERVICE_LEVEL'].astype(str).str.contains(
+                'EXPRESS SAVER', case=False, na=False)
+            df = df[keep].copy().reset_index(drop=True)
+            log.info('express-only filter: %d express rows kept', len(df))
 
     # ── Pallet rows (optional) ───────────────────────────────────────────────
     df_pal_ext = pd.DataFrame()
@@ -1709,12 +1877,36 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         df_min = optimize_globally_df(df_opt) if not df_opt.empty else pd.DataFrame()
         df_ext_final, df_opt_final, df_min_final = df, df_opt, df_min
 
+    add_buckets = not express_only   # express-only builds are parcel-only
+
+    # Parcel postcode expansion is applied to the MINIMAL stage only — that is the
+    # deliverable CargoWrite consumes (and the source of the combined export).
+    # Extended / optimized stay compact diagnostics. Pallet rows are untouched.
+    pc_warn = None
+
+    def _explode_min(frame):
+        nonlocal pc_warn
+        exploded, n = explode_parcel_postcodes(frame, parcel_postcodes)
+        if n == -1 and pc_warn is None:
+            pc_warn = (f"⚠️ {country}: no postcode list available — parcel rows "
+                       f"left blank, so CargoWrite will skip them. Add {country} "
+                       f"postcodes to the pallet/postcode file.")
+        elif n > 0:
+            log.info('%s: exploded %d blank parcel rows × %d postcodes',
+                     country, n, len([p for p in (parcel_postcodes or []) if str(p).strip()]))
+        return exploded
+
     if has_pallet:
         # Merge pallet rows into each stage (pallet rows never dominate parcel
         # rows and vice-versa — different shipment profiles), write with formulas.
         ext_all = _align_columns([df_ext_final, df_pal_ext])
         opt_all = _align_columns([df_opt_final, df_pal_opt])
         min_all = _align_columns([df_min_final, df_pal_opt])
+        if add_buckets:
+            ext_all = append_euroconnect_buckets(ext_all)
+            opt_all = append_euroconnect_buckets(opt_all)
+            min_all = append_euroconnect_buckets(min_all)
+        min_all = _explode_min(min_all)
         write_matrix_with_formulas(ext_all, ext_path, cfg, cd, vl, pallet_maut,
                                    pallet_defaults)
         write_matrix_with_formulas(opt_all, opt_path, cfg, cd, vl, pallet_maut,
@@ -1724,6 +1916,11 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         rows_ext, rows_opt, rows_min = len(ext_all), len(opt_all), len(min_all)
         extended_frame, optimized_frame, minimal_frame = ext_all, opt_all, min_all
     elif any_buckets:
+        if add_buckets:
+            df_ext_final = append_euroconnect_buckets(df_ext_final)
+            df_opt_final = append_euroconnect_buckets(df_opt_final)
+            df_min_final = append_euroconnect_buckets(df_min_final)
+        df_min_final = _explode_min(df_min_final)
         write_matrix_excel(df_ext_final, ext_path, cfg, cd, vl)
         write_matrix_excel(df_opt_final, opt_path, cfg, cd, vl)
         write_matrix_excel(df_min_final, min_path, cfg, cd, vl)
@@ -1732,16 +1929,20 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         extended_frame, optimized_frame = df_ext_final, df_opt_final
         minimal_frame = df_min_final
     else:
+        if add_buckets:
+            df     = append_euroconnect_buckets(df)
+            df_opt = append_euroconnect_buckets(df_opt)
+            df_min = append_euroconnect_buckets(df_min)
         write_matrix_excel(df, ext_path, cfg, cd, vl)
         write_matrix_excel(df_opt, opt_path, cfg, cd, vl)
-        stats = optimize_globally(opt_path, min_path)
-        rows_ext, rows_opt, rows_min = len(df), len(df_opt), stats['output_rows']
-        # reload the written minimal frame so the combined export has numerics
-        try:
-            minimal_frame = pd.read_excel(min_path, sheet_name=0)
-        except Exception:
-            minimal_frame = df_min
-        # extended/optimized are still the numeric in-memory frames
+        # Use the in-memory minimal frame (optimize_globally_df, computed above)
+        # rather than the optimize_globally Excel round-trip + read_excel: the
+        # round-trip coerced POSTCODE to float and dropped leading zeros. Explode
+        # parcel postcodes, then write numerically.
+        df_min = _explode_min(df_min)
+        write_matrix_excel(df_min, min_path, cfg, cd, vl)
+        rows_ext, rows_opt, rows_min = len(df), len(df_opt), len(df_min)
+        minimal_frame = df_min
         extended_frame, optimized_frame = df, df_opt
 
     # Persist the numeric stage frames for the combined-workbook export.
@@ -1770,6 +1971,7 @@ def run_pipeline_from_parsed(parsed, country, output_dir, cfg,
         'rows_optimized': rows_opt,
         'rows_minimal':   rows_min,
         'pallet_warning': pallet_warn,
+        'postcode_warning': pc_warn,
     }
 
 
@@ -1834,7 +2036,7 @@ PALLET_COLUMN_ORDER = [
     'POSTCODE', 'MIN_WEIGHT', 'MAX_WEIGHT', 'MIN_VOLUME', 'MAX_VOLUME',
     'MIN_PARCEL', 'MAX_PARCEL', 'EACH_WEIGHT', 'EACH_VOLUME',
     'FACTORED RATE PALLET', 'USER_DEF_TYPE_1', 'USER_DEF_TYPE_2',
-    'USER_DEF_TYPE_4 (max 1,5m)',
+    'USER_DEF_TYPE_4 (max 1,5m)', 'AWKWARD',
     'RATE_BASE', 'RATE_EXTRA', 'MOBILITY', 'FUEL', 'MAUT', 'Linehaul UPSDE',
     'TOLL', 'ADMIN', 'TOTAL_PRICE',
 ]
@@ -1894,7 +2096,7 @@ def build_pallet_df(country, zip_rate_map, band_ceilings,
                 'EACH_WEIGHT': None, 'EACH_VOLUME': None,
                 'FACTORED RATE PALLET': rate_base,
                 'USER_DEF_TYPE_1': None, 'USER_DEF_TYPE_2': None,
-                'USER_DEF_TYPE_4 (max 1,5m)': None,
+                'USER_DEF_TYPE_4 (max 1,5m)': None, 'AWKWARD': None,
                 'RATE_BASE': rate_base, 'RATE_EXTRA': 0,
                 'MOBILITY': mob, 'FUEL': fuel, 'MAUT': maut,
                 'Linehaul UPSDE': None, 'TOLL': toll, 'ADMIN': admin,
@@ -1956,17 +2158,14 @@ def write_matrix_numeric(df, output_path, country_cfg, variables_layout=None,
     for ci, col in enumerate(order, 1):
         ws.cell(1, ci, col)
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
-    fill        = PatternFill('solid', fgColor='FFF2CC')   # pale amber = catch-all bucket
-    pallet_fill = PatternFill('solid', fgColor='0070C0')   # orange = pallet (DHL-FENDER) row
+    fill = PatternFill('solid', fgColor='FFF2CC')
     for ri, rec in enumerate(df_sorted.to_dict('records'), start=2):
         is_bucket = bool(rec.get('_is_bucket'))
-        is_pallet = (rec.get('CARRIER_ID') == 'DHL-FENDER')
-        row_fill  = pallet_fill if is_pallet else (fill if is_bucket else None)
         for ci, col in enumerate(order, 1):
             v = rec.get(col)
             cell = ws.cell(ri, ci, None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
-            if row_fill is not None:
-                cell.fill = row_fill
+            if is_bucket:
+                cell.fill = fill
     vs = wb.create_sheet('Variables')
     for ri, (name, val) in enumerate(vl, 1):
         vs.cell(ri, 1, name)
@@ -2076,8 +2275,7 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
         ws.cell(1, ci, col)
 
     df_sorted = df.sort_values('TOTAL_PRICE', kind='stable').reset_index(drop=True)
-    fill        = PatternFill('solid', fgColor='FFF2CC')   # pale amber = catch-all bucket
-    pallet_fill = PatternFill('solid', fgColor='0070C0')   # orange = pallet (DHL-FENDER) row
+    fill = PatternFill('solid', fgColor='FFF2CC')
 
     L_RATE  = L['RATE_BASE']
     L_EXTRA = L.get('RATE_EXTRA')
@@ -2097,9 +2295,13 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
         carrier   = rec.get('CARRIER_ID')
         is_bucket = bool(rec.get('_is_bucket'))
         is_pallet = (carrier == 'DHL-FENDER')
+        # Sentinel catch-all bucket (no rate components): keep its literal price.
+        sentinel = is_bucket and pd.isna(rec.get('RATE_BASE'))
         formulas = {}
 
-        if is_pallet:
+        if sentinel:
+            pass
+        elif is_pallet:
             iso = rec.get('COUNTRYISO2')
             formulas['FUEL']     = f"=Variables!$B${r_fuel}*{L_RATE}{ri}"
             formulas['MOBILITY'] = f"=Variables!$B${r_mob}*{L_RATE}{ri}"
@@ -2150,9 +2352,7 @@ def write_matrix_with_formulas(df, output_path, country_cfg,
             else:
                 v = rec.get(col)
                 cell = ws.cell(ri, ci, None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
-            if is_pallet:
-                cell.fill = pallet_fill
-            elif is_bucket:
+            if is_bucket:
                 cell.fill = fill
 
     # ── Variables sheet ──────────────────────────────────────────────────────

@@ -46,6 +46,7 @@ ALL_COUNTRIES  = sorted(pl.COUNTRY_CONFIG.keys())
 CARRIER_LABELS = {cid: cfg['label'] for cid, cfg in pl.CARRIER_DEFAULTS.items()}
 FUEL_CARRIERS  = ['UPDE', 'DHL-ROS', 'DPD', 'UPSNL', 'POSTNORD', 'UPSGB']
 MAUT_CARRIERS  = ['DPD', 'DHL-ROS']
+EXPRESS_CARRIERS = ['UPDE', 'UPSNL', 'UPSGB']   # the only carriers quoting EXPRESS SAVER
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -115,6 +116,17 @@ def persist(result):
             dst = Path(out) / Path(result[key]).name
             shutil.copy(result[key], dst)
             result[key] = str(dst)
+    return result
+
+
+def express_rename(result):
+    """Rename the three matrix files to carry an _EXPRESS_ marker so the
+    express downloads can't be confused with a standard run."""
+    for key in ('extended', 'optimized', 'minimal'):
+        p = Path(result[key])
+        new = p.with_name(p.name.replace('_Matrix_', '_EXPRESS_Matrix_'))
+        shutil.move(str(p), str(new))
+        result[key] = str(new)
     return result
 
 
@@ -466,6 +478,13 @@ with st.sidebar:
     st.divider()
     run_btn = st.button("▶ Generate matrices", type="primary",
                         use_container_width=True, disabled=(uploaded is None))
+    exp_btn = st.button("⚡ Express-only matrices",
+                        use_container_width=True, disabled=(uploaded is None),
+                        help="Build a matrix with ONLY the EXPRESS SAVER options — "
+                             "UPS DE (7R9W62 + EXPRESS SAVER), UPS NL EXPRESS SAVER, "
+                             "UPS GB EXPRESS SAVER. No STANDARD, no DPD/DHL, no pallets. "
+                             "Results appear in their own section so a standard run "
+                             "isn't overwritten.")
     if uploaded is None:
         st.caption("Upload a rate card first.")
 
@@ -649,9 +668,13 @@ st.divider()
 # ── Run ────────────────────────────────────────────────────────────────────────
 if 'results' not in st.session_state:
     st.session_state.results = {}
+if 'results_express' not in st.session_state:
+    st.session_state.results_express = {}
 
-if run_btn and uploaded and selected:
-    st.session_state.results = {}
+if (run_btn or exp_btn) and uploaded and selected:
+    express_mode = bool(exp_btn)
+    _store = 'results_express' if express_mode else 'results'
+    st.session_state[_store] = {}
     input_path = st.session_state['input_path']
     errors = {}
     rules    = exception_rules_from_editor(st.session_state.get('exceptions_df', DEFAULT_EXCEPTIONS))
@@ -694,8 +717,16 @@ if run_btn and uploaded and selected:
                           text=f"Processing {country}…  ({idx+1}/{len(selected)})")
         try:
             cfg = country_cfg_with_overrides(country)
+            if express_mode:
+                cfg['carriers'] = [c for c in cfg['carriers']
+                                   if c in EXPRESS_CARRIERS]
             pallet_zones = (pp.country_pallet_data(pallets, country)
-                            if pallets else None)
+                            if pallets and not express_mode else None)
+            # Postcode list for parcel expansion: sourced from the pallet file's
+            # per-country zip prefixes regardless of the pallet-merge / express
+            # toggles (express rows are parcel rows and still need postcodes).
+            parcel_postcodes = (list(pp.country_pallet_data(pallets, country).keys())
+                                if pallets else None)
 
             if is_master:
                 parsed = mp.country_rate_data(master, country)
@@ -718,12 +749,18 @@ if run_btn and uploaded and selected:
                     exceptions=rules, overflow_rules=ov_rules, postcode_rules=pc_rules,
                     pallet_zones=pallet_zones, pallet_defaults=pal_defaults,
                     pallet_overrides=pal_overrides, pallet_maut=pallet_maut_table,
-                    pallet_max_band_kg=(pallet_max_band_kg or None))
+                    pallet_max_band_kg=(pallet_max_band_kg or None),
+                    express_only=express_mode,
+                    parcel_postcodes=parcel_postcodes)
                 result = persist(result)
+            if express_mode:
+                result = express_rename(result)
 
             if result.get('pallet_warning'):
                 errors.setdefault(country, []).append(result['pallet_warning'])
-            st.session_state.results[country] = result
+            if result.get('postcode_warning'):
+                errors.setdefault(country, []).append(result['postcode_warning'])
+            st.session_state[_store][country] = result
         except Exception as e:
             errors.setdefault(country, []).append(str(e))
 
@@ -735,14 +772,17 @@ if run_btn and uploaded and selected:
             else:
                 st.error(f"**{country}**: {msg}")
 
-elif run_btn and not selected:
+elif (run_btn or exp_btn) and not selected:
     st.warning("Please select at least one country.")
 
 # ── Results ──────────────────────────────────────────────────────────────────
-if st.session_state.results:
-    st.markdown("## Results")
-    results = st.session_state.results
-
+def render_results(results, heading, kp, fname_prefix, *, caption=None):
+    """Render the summary + per-country + bulk download blocks for one result set.
+    `kp` (key-prefix) keeps Streamlit widget keys unique across the two sections;
+    `fname_prefix` marks express download filenames."""
+    st.markdown(heading)
+    if caption:
+        st.caption(caption)
     summary = [{'Country': c, 'Extended': f"{r['rows_extended']:,}",
                 'Optimized': f"{r['rows_optimized']:,}", 'Minimal': f"{r['rows_minimal']:,}"}
                for c, r in results.items()]
@@ -760,14 +800,14 @@ if st.session_state.results:
             col.download_button(label, data=file_bytes(r[key]),
                                 file_name=Path(r[key]).name,
                                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                                key=f'dl_{country}_{key}')
+                                key=f'dl_{kp}_{country}_{key}')
 
     st.markdown("#### Download everything")
     dc1, dc2 = st.columns(2)
     with dc1:
         st.download_button("📦 Download all countries as ZIP", data=make_zip(results),
-                           file_name="rate_matrices.zip", mime="application/zip",
-                           type="primary")
+                           file_name=f"{fname_prefix}rate_matrices.zip", mime="application/zip",
+                           type="primary", key=f'dl_{kp}_zip')
     with dc2:
         _vl_rows = st.session_state.get('variables_layout_rows', pl.VARIABLES_LAYOUT)
         _xlsx_mime = ('application/vnd.openxmlformats-officedocument.'
@@ -775,10 +815,9 @@ if st.session_state.results:
         st.caption("🧩 **Combined** — every selected country merged into one sheet, "
                    "sorted by country then price. Numeric values so per-country "
                    "surcharges (e.g. MAUT) stay correct.")
-        _stages = [('extended',  '🧩 Combined extended'),
-                   ('optimized', '🧩 Combined optimized'),
-                   ('minimal',   '🧩 Combined minimal')]
-        for _stage, _label in _stages:
+        for _stage, _label in [('extended',  '🧩 Combined extended'),
+                               ('optimized', '🧩 Combined optimized'),
+                               ('minimal',   '🧩 Combined minimal')]:
             _combined = make_combined(
                 results, _vl_rows, stage=_stage,
                 pallet_maut=st.session_state.get('pallet_maut_table'),
@@ -787,8 +826,19 @@ if st.session_state.results:
             if _combined is not None:
                 st.download_button(
                     _label, data=_combined,
-                    file_name=f"Combined_Matrix_{_stage}.xlsx", mime=_xlsx_mime,
-                    key=f'dl_combined_{_stage}',
+                    file_name=f"{fname_prefix}Combined_Matrix_{_stage}.xlsx", mime=_xlsx_mime,
+                    key=f'dl_{kp}_combined_{_stage}',
                     type=('primary' if _stage == 'minimal' else 'secondary'))
             else:
                 st.caption(f"Combined {_stage} unavailable — re-run to regenerate.")
+
+
+if st.session_state.get('results'):
+    render_results(st.session_state.results, "## Results", "std", "")
+
+if st.session_state.get('results_express'):
+    st.divider()
+    render_results(
+        st.session_state.results_express, "## ⚡ Express-only results", "exp", "EXPRESS_",
+        caption="EXPRESS SAVER options only — UPS DE (7R9W62 + EXPRESS SAVER), "
+                "UPS NL EXPRESS SAVER, UPS GB EXPRESS SAVER. No STANDARD / pallets.")
