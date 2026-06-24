@@ -299,3 +299,179 @@ Numeric values keep every country correct in one file. A Variables sheet is
 still included for reference. The engine function is
 `pipeline.write_combined_matrix(frames, path, variables_layout)`; the app builds
 it from each country's persisted minimal frame (`result['minimal_df']`).
+
+---
+
+# Appendix — Full function reference (current PALLET2 build)
+
+What every function does, file by file. `_name` = internal helper, not meant to be
+called from outside its module. Read this **with** the architecture notes above,
+not instead of them.
+
+**Live import graph:** `app.py` → `pipeline.py` + `master_parser.py` +
+`pallet_parser.py`. That is the whole running app.
+
+> ⚠️ **`pallet_pipeline.py` is NOT used by the app** — nothing imports it. It is an
+> earlier, standalone pallet builder kept in the repo for history. The pallets you
+> see in real output are built by `pipeline.build_pallet_df()`, fed by
+> `pallet_parser`. Safe to delete `pallet_pipeline.py` on handover; it only causes
+> confusion (two modules that look like they build pallets — only one does).
+
+---
+
+## `app.py` — the Streamlit UI (the only file users touch)
+
+Module constants: `ALL_COUNTRIES`, `CARRIER_LABELS`, `FUEL_CARRIERS`,
+`MAUT_CARRIERS`, `EXPRESS_CARRIERS`, `DEFAULT_EXCEPTIONS`, `DEFAULT_OVERFLOW`,
+`DEFAULT_POSTCODE`, `DEFAULT_HEAVY`, `COLS`.
+
+| Function | What it does |
+|----------|--------------|
+| `_pct_input(label, key, default)` | One sidebar percentage field; stores/reads the value as a fraction in session state. |
+| `variables_layout(fuel_vals, maut_dhl, maut_dpd, pallet_vals=None)` | Assembles the **Variables sheet** rows (fuel, MAUT, mobility, toll, admin, factor) from current sidebar values, to embed in every workbook. |
+| `carrier_defaults(fuel_vals, maut_dhl, maut_dpd)` | Turns sidebar values into the per-carrier defaults dict the pipeline expects. |
+| `country_cfg_with_overrides(country)` | Base country config from `pipeline.COUNTRY_CONFIG` merged with any UI overrides. |
+| `persist(result)` | Copies a country's generated files out of the build temp dir into a longer-lived one so downloads survive Streamlit reruns. |
+| `express_rename(result)` | Renames the three matrix files with an `_EXPRESS_` marker for the express-only build. |
+| `file_bytes(p)` | Reads a file into bytes for a download button. |
+| `exception_rules_from_editor(edited_df)` | Converts the **size-limit** editor table into `apply_exceptions` rule dicts. |
+| `overflow_rules_from_editor(edited_df)` | Converts the **overflow** editor table into `add_overflow_buckets` rule dicts. |
+| `postcode_rules_from_editor(edited_df)` | Converts the **postcode** editor table into `add_postcode_catchall` rule dicts. |
+| `heavy_rules_from_editor(edited_df)` | Converts the **heavy per-kg rate** editor table into overflow rate rules. |
+| `_default_pallet_maut_df()` | Seed table for the editable pallet-MAUT grid. |
+| `pallet_maut_from_editor(edited_df)` | Converts the pallet-MAUT editor table into the `{country: …}` map `build_pallet_df` expects. |
+| `make_zip(results)` | Bundles every country's three files into one ZIP. |
+| `make_combined(results, variables_layout_rows, stage='minimal', …)` | Builds the single **all-countries combined** workbook for the chosen stage. |
+| `render_results(results, heading, kp, fname_prefix, *, caption=None)` | Renders the summary + per-country + bulk-download UI block for one result set (normal or express). |
+
+---
+
+## `pipeline.py` — parcel core: parse → build → compute → optimize → write
+
+Config constants you'd actually edit: `CARRIER_DEFAULTS`, `COUNTRY_CONFIG`,
+`PALLET_DEFAULTS`, `PALLET_COUNTRY_OVERRIDES`, `PALLET_MAUT`. Layout/order
+constants (rarely touched): `VARIABLES_LAYOUT`, `CARRIER_BUILDERS`,
+`COLUMN_ORDER`, `COL_LETTER`, `PALLET_COLUMN_ORDER`, `EUROCONNECT_BUCKET_*`.
+
+### Parsing — legacy per-country workbook
+| Function | What it does |
+|----------|--------------|
+| `_default_country_cfg(iso2)` | Fallback config for a country not in `COUNTRY_CONFIG`. |
+| `_norm(v)` | Normalise any cell: lowercase, collapse punctuation/whitespace to single spaces. |
+| `_cell_match(cell_value, *needles)` | True if the normalised cell contains/equals any normalised needle. |
+| `_parse_float(v)` | Robust float parse — comma decimals, currency symbols, `None`. |
+| `_find_sheet(wb, *name_hints)` | First sheet whose name fuzzy-matches any hint. |
+| `_scan_anchor(ws, *anchor_texts, …)` | First cell fuzzy-matching an anchor; used to locate tables. |
+| `_find_from_to(ws, …)` | Locate the From/To weight-band header row (multi-language, wide window). |
+| `_extract_tiers(ws, …)` | Read weight-band tiers, tolerating blank spacers, comma-decimals, "over X". |
+| `_extract_rates_by_zone(ws, hrow, from_col, to_col)` | Read per-zone rate columns into tiers. |
+| `_parse_upsde_zones(ws)` | Parse the UPS DE postcode→zone table (incl. alphanumeric ES4/5/6 zones). |
+| `_parse_postnord_sheet(ws)` | Four-strategy PostNord sheet parser. |
+| `parse_rate_cards(excel_path)` | **Entry point** for the legacy per-country file; returns the parsed rate dict. |
+
+### Row building — one builder per carrier
+| Function | What it does |
+|----------|--------------|
+| `lookup_tier_rate(tiers, weight)` | Rate for a given weight from a tier list. |
+| `collapse_same_rate_tiers(tiers, weight_cap=None)` | Merge adjacent tiers sharing a rate. |
+| `_upde_service_buckets(rate_data, service_key, country_cfg)` | Group a UPDE service into `(postcode_prefix, tiers)`. |
+| `_common(site, client, carrier, iso2)` | Shared CargoWrite key fields for a row. |
+| `build_combined_weight_rows(…)` | Emit **Model-B** rows: one rate on the whole-shipment payweight. |
+| `build_rows_upde(rate_data, country_cfg)` | UPS DE — zoned, Single/Multi `RATE_TYPE`. |
+| `build_rows_dhl(rate_data, country_cfg)` | DHL — BNL "first + each additional", else Other-countries tiers. |
+| `build_rows_dpd(rate_data, country_cfg)` | DPD — genuine per-parcel pricing. |
+| `build_rows_upsnl(rate_data, country_cfg)` | UPS NL — Express Saver by zone. |
+| `build_rows_postnord(rate_data, country_cfg)` | PostNord — flat rate per service (B2B / Home / PUDO). |
+| `build_rows_upsgb(rate_data, country_cfg)` | UPS GB (UK domestic) — STDS single/per-parcel, STDM combined, EXPS; rates in **GBP**. |
+| `build_extended_matrix(parsed, country_cfg)` | Run every applicable builder → the full **extended** row set. |
+
+### Compute & write (Excel)
+| Function | What it does |
+|----------|--------------|
+| `compute_numeric_totals(df, carrier_defaults=None)` | Fill `TOTAL_PRICE` and surcharge columns as plain numbers. |
+| `_build_formulas_for_row(row_dict, excel_row, carrier_defaults=None)` | Build the live Excel formulas for one row. |
+| `write_matrix_excel(df, output_path, country_cfg, …)` | Write a per-country workbook with formulas + Variables sheet. |
+| `_letter_map`, `_ensure_var`, `_update_formula`, `_write_filtered_excel`, `_ensure_numeric`, `_recompute_total` | Excel/formula plumbing helpers (column letters, ensuring a Variables row exists, rewriting cell refs after row deletion, numeric coercion, total recompute). |
+
+### Optimizers — the three stages
+| Function | What it does |
+|----------|--------------|
+| `optimize_matrix(df)` | **Within-carrier** dominance (groups by carrier+service+postcode). Produces the *optimized* stage. |
+| `optimize_globally(input_path, output_path)` | **Cross-carrier** dominance via an Excel round-trip. Produces the *minimal* stage. |
+| `optimize_globally_df(df)` | Same cross-carrier logic in pure pandas (postcode-partitioned for speed) so buckets can be added before writing. **This is the one the live path uses.** |
+
+> Known structural limit (carried over): the global optimizer is **service-level
+> blind**, so cheaper STANDARD rows can dominate out EXPRESS SAVER rows. The
+> express-only build mode is the current workaround.
+
+### Buckets & exceptions (all take generic rule dicts)
+| Function | What it does |
+|----------|--------------|
+| `apply_exceptions(df, rules)` | Stamp size limits on in-scope base rows + append amber **bucket twins**. |
+| `add_overflow_buckets(df, rules, …)` | Append heavy / extra-parcel overflow rows (rate×n + surcharge×n, no upper caps). |
+| `add_postcode_catchall(df, rules, …)` | For zoned carriers, append a blank-postcode fallback at the worst-zone rate. |
+
+### Pallets & orchestration
+| Function | What it does |
+|----------|--------------|
+| `_pallet_maut_for(country, ceiling_kg, maut_table)` | Pick the right two-tier MAUT for a pallet weight. |
+| `build_pallet_df(country, zip_rate_map, band_ceilings, …)` | **The live pallet builder** — emits DHL-FENDER zone×bucket rows; returns `(df, maut_known)`. |
+| `collapse_pallet_bands(df_pallet)` | Within each (country, zip), drop a band whose `RATE_BASE` equals the band above (redundant). |
+| `_align_columns(frames)` | Concat frames on a union of columns (pallet order when pallet rows present). |
+| `write_matrix_numeric(df, …)` | Write a matrix as **numeric values** — used whenever pallet rows are present. |
+| `write_matrix_with_formulas(df, …)` | Write a pallet-inclusive matrix with **formulas** referencing the Variables sheet. |
+| `write_combined_matrix(frames, …)` | Merge all countries' minimal frames into one sheet; always `formulas=False`. |
+| `append_euroconnect_buckets(df, …)` | Append one EUROCONNECT catch-all row per country (`MAX_WEIGHT 24000`, `TOTAL_PRICE 999999`). |
+| `run_pipeline(input_path, country, …)` | Full build for one country from a **legacy file path**. |
+| `run_pipeline_from_parsed(parsed, country, output_dir, cfg, …)` | **Main orchestrator** — full build for one country from an already-parsed dict (master-file path; supports `express_only`). |
+
+---
+
+## `master_parser.py` — the DSV master workbook (all countries, one file)
+
+The current real-world input. One sheet per rate table; parsed once, then sliced
+per country into the same shape `parse_rate_cards()` produces.
+
+| Function | What it does |
+|----------|--------------|
+| `is_master_file(path)` | True if the workbook looks like the DSV master (one sheet per table). |
+| `_scan_from_to(ws)` | Find the From/To header anywhere in a sheet. |
+| `_find_label_row(ws, *labels)` | First row containing **all** the given labels → `(row, {label: col})`. |
+| `_extract_zone_tiers(ws, hrow, from_col, to_col)` | `{zone_key: tiers}` for every zone column right of "To". |
+| `_flat_country_rates(ws, value_col_offset=1)` | For "XX rate" sheets (WEA, etc.) → `{ISO2: rate}`. |
+| `_parse_upsde_zones(ws)` | `ZONES UPSDE` → per-country postcode bands with zone per service. |
+| `_parse_upsnl_zones(ws)` | `ZONES UPSNL EXPRESS` → `{ISO2: zone}` (Express Saver). |
+| `_parse_dpd(ws)` | `PARCEL - DPD` → `{ISO2: {normal, small}}`. |
+| `_parse_maut(ws)` | `MAUT SURCHARGE` → `{ISO2: {DHL-ROS, DPD}}` (read automatically). |
+| `_parse_dhl_other(ws)` | `PARCEL - DHL - Other countries` → `{ISO2: tiers}`. |
+| `_parse_dhl_bnl(ws)` | `PARCEL - DHL - BNL` → `{ISO2: {first, after}}`. |
+| `_parse_postnord(ws)` | `PARCEL - POSTNORD - STD` → `{ISO2: {B2B, HOME, PUDO}}`. |
+| `_parse_gb_tiers(ws)` | Single-rate-column tier table (UPSGB STDS/STDM/EXPS). |
+| `_parse_linehaul(ws)` | First numeric value next to a Carrier/UPS label. |
+| `parse_master_rate_card(path)` | **Entry point** — parse the whole master workbook once into a structured dict. |
+| `country_rate_data(master, iso2)` | Slice the master into one country's parsed dict (pipeline-ready shape). |
+| `country_maut(master, iso2)` | `{DHL-ROS, DPD}` MAUT for a country (0.0 if absent). |
+| `available_countries(master)` | All ISO2 codes that have any rate data. |
+
+---
+
+## `pallet_parser.py` — the DHL "pricing with factor" workbook
+
+| Function | What it does |
+|----------|--------------|
+| `is_pallet_factor_file(path)` | True if this is the DHL factor workbook (Country / Zip / "<n> kg" columns). |
+| `_band_ceiling(header_value)` | `"100,1 - 200 kg"` → `200`; `"FTL"` → `None`. |
+| `parse_pallet_factor_file(path)` | **Entry point** — parse the whole workbook once. |
+| `available_pallet_countries(parsed)` | Countries that have pallet data. |
+| `country_pallet_data(parsed, iso2)` | `{zip_prefix: {band_kg: rate}}` for one country. |
+| `band_ceilings(parsed)` | Ordered list of weight-band ceilings. |
+
+---
+
+## `pallet_pipeline.py` — ⚠️ legacy, not wired in
+
+Standalone pallet builder from before pallets were folded into `pipeline.py`.
+**Not imported anywhere.** Functions (`build_rows_pallet`, `optimize_pallet`,
+`write_pallet_excel`, `run_pallet_pipeline`, `_maut_for`) duplicate logic now
+living in `pipeline.build_pallet_df` / `collapse_pallet_bands` /
+`write_matrix_*`. Delete on handover unless you want it as a historical reference.
